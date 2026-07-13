@@ -4,6 +4,8 @@ import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, S
 
 const BAR_TO_MH2O = 10.19716;
 const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
+const ASSOC_CSV_URL =
+  "https://docs.google.com/spreadsheets/d/e/2PACX-1vQAi-_8-SD1mogQMDKb5j2kfl0xzJub5kXE1F0YTnkVV_qiBBjYFfTOTRsE-_ylRNcTxu9vKbswww2W/pub?gid=1661818251&single=true&output=csv";
 
 function normEUI(s) {
   return String(s || "").replace(/[^0-9a-fA-F]/g, "").toLowerCase();
@@ -68,13 +70,19 @@ async function readWorkbook(file) {
   return XLSX.read(buf, { type: "array", cellDates: false });
 }
 
+async function fetchWorkbookFromUrl(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`No s'ha pogut descarregar el full de Google Sheets (${res.status}).`);
+  const text = await res.text();
+  return XLSX.read(text, { type: "string" });
+}
+
 function fmt(n, d = 2) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return n.toLocaleString("es-ES", { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
-async function parseAssociationWorkbook(file) {
-  const assocWb = await readWorkbook(file);
+function parseAssociationFromWorkbook(assocWb) {
   const assocSheet = findSheetWithHeader(assocWb, [/dev\s*eui/i, /cable\s*fins\s*cota/i]);
   if (!assocSheet) {
     throw new Error('No encuentro una hoja con columnas "DEV EUI" y "Cable fins cota" en el archivo de asociación.');
@@ -104,6 +112,14 @@ async function parseAssociationWorkbook(file) {
     assocMap.set(eui, { pozo: String(pozo), cota, cable });
   }
   return { map: assocMap, excluded };
+}
+
+async function parseAssociationFile(file) {
+  return parseAssociationFromWorkbook(await readWorkbook(file));
+}
+
+async function parseAssociationUrl(url) {
+  return parseAssociationFromWorkbook(await fetchWorkbookFromUrl(url));
 }
 
 function loadAssocFromStorage() {
@@ -140,8 +156,8 @@ function saveAssocToStorage(data) {
 }
 
 export default function App() {
-  const [assocData, setAssocData] = useState(null); // { map, excluded, fileName, savedAt }
-  const [assocLoading, setAssocLoading] = useState(false);
+  const [assocData, setAssocData] = useState(null); // { map, excluded, fileName, savedAt, source }
+  const [assocLoading, setAssocLoading] = useState(true);
   const [assocError, setAssocError] = useState(null);
   const [assocPersisted, setAssocPersisted] = useState(true);
   const [readingsFile, setReadingsFile] = useState(null);
@@ -152,17 +168,39 @@ export default function App() {
   const [collapsed, setCollapsed] = useState({});
   const [showExcluded, setShowExcluded] = useState(false);
 
-  useEffect(() => {
-    const saved = loadAssocFromStorage();
-    if (saved) setAssocData(saved);
+  const syncFromSheet = useCallback(async ({ silent } = {}) => {
+    if (!silent) setAssocLoading(true);
+    setAssocError(null);
+    try {
+      const { map, excluded } = await parseAssociationUrl(ASSOC_CSV_URL);
+      const data = { map, excluded, fileName: "Google Sheets (automàtic)", savedAt: new Date().toISOString(), source: "url" };
+      setAssocPersisted(saveAssocToStorage(data));
+      setAssocData(data);
+      setResults(null);
+    } catch (e) {
+      // Si falla la conexión (p. ex. sense internet), usem la darrera còpia guardada.
+      const saved = loadAssocFromStorage();
+      if (saved) {
+        setAssocData(saved);
+        setAssocError(`No s'ha pogut connectar amb Google Sheets ara mateix — mostrant l'última còpia guardada (${new Date(saved.savedAt).toLocaleString("es-ES")}).`);
+      } else {
+        setAssocError(e.message || String(e));
+      }
+    } finally {
+      setAssocLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    syncFromSheet();
+  }, [syncFromSheet]);
 
   const handleAssocFile = useCallback(async (file) => {
     setAssocLoading(true);
     setAssocError(null);
     try {
-      const { map, excluded } = await parseAssociationWorkbook(file);
-      const data = { map, excluded, fileName: file.name, savedAt: new Date().toISOString() };
+      const { map, excluded } = await parseAssociationFile(file);
+      const data = { map, excluded, fileName: file.name, savedAt: new Date().toISOString(), source: "file" };
       const persisted = saveAssocToStorage(data);
       setAssocPersisted(persisted);
       setAssocData(data);
@@ -181,6 +219,7 @@ export default function App() {
     setAssocData(null);
     setResults(null);
   };
+
 
   const process = useCallback(async (assocMap, assocExcluded, readings) => {
     setLoading(true);
@@ -328,41 +367,32 @@ export default function App() {
             <div style={styles.assocLoadedCard}>
               <CheckCircle2 size={20} color="#2a8f6c" />
               <div style={{ flex: 1 }}>
-                <div style={styles.uploadLabel}>Fitxer d'associació carregat</div>
+                <div style={styles.uploadLabel}>
+                  {assocData.source === "url" ? "Pous sincronitzats amb Google Sheets" : "Fitxer d'associació carregat manualment"}
+                </div>
                 <div style={styles.uploadHint}>
-                  {assocData.fileName} · desat el {new Date(assocData.savedAt).toLocaleString("es-ES")}
-                  {!assocPersisted && " · no s'ha pogut desar per a la propera visita"}
+                  {assocData.fileName} · actualitzat el {new Date(assocData.savedAt).toLocaleString("es-ES")}
+                  {!assocPersisted && " · no s'ha pogut desar còpia local per quan no hi hagi connexió"}
                 </div>
               </div>
-              <label htmlFor="assoc-input" style={styles.smallLinkBtn}>
+              <button style={styles.smallLinkBtn} onClick={() => syncFromSheet()} disabled={assocLoading}>
                 <RefreshCw size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
-                Canviar
-              </label>
-              <input
-                id="assoc-input"
-                type="file"
-                accept=".xlsx,.xls"
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) handleAssocFile(f);
-                }}
-              />
+                {assocLoading ? "Actualitzant…" : "Actualitzar ara"}
+              </button>
             </div>
           ) : (
-            <UploadCard
-              label="1. Fitxer d'associació (pou ↔ DevEUI)"
-              hint={assocLoading ? "Carregant…" : "Excel amb columnes DEV EUI, Código pozo, COTA, Cable fins cota"}
-              file={null}
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) handleAssocFile(f);
-              }}
-              inputId="assoc-input"
-            />
+            <div style={styles.assocLoadedCard}>
+              <RefreshCw size={20} color="#7c9490" />
+              <div style={{ flex: 1 }}>
+                <div style={styles.uploadLabel}>{assocLoading ? "Connectant amb Google Sheets…" : "Sense dades d'associació"}</div>
+                <div style={styles.uploadHint}>
+                  {assocLoading ? "Descarregant el full de pous" : "No s'ha pogut carregar cap font de dades"}
+                </div>
+              </div>
+            </div>
           )}
           <UploadCard
-            label="2. Fitxer de lectures"
+            label="Fitxer de lectures"
             hint="Excel export amb columnes DevEUI, Marca de temps, Payload (HEX)"
             file={readingsFile}
             onChange={handleFile(setReadingsFile)}
@@ -370,11 +400,21 @@ export default function App() {
           />
         </div>
 
-        {assocData && (
-          <button style={styles.tinyClearBtn} onClick={clearAssocFile}>
-            Eliminar fitxer d'associació desat
-          </button>
-        )}
+        <div style={styles.manualUploadRow}>
+          <label htmlFor="assoc-input" style={styles.tinyClearBtn}>
+            Pujar un fitxer d'associació manualment (en lloc de Google Sheets)
+          </label>
+          <input
+            id="assoc-input"
+            type="file"
+            accept=".xlsx,.xls"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) handleAssocFile(f);
+            }}
+          />
+        </div>
 
         <div style={styles.actionRow}>
           <button
@@ -591,6 +631,7 @@ const styles = {
     padding: 0,
     textDecoration: "underline",
   },
+  manualUploadRow: { marginTop: 4 },
   uploadLabel: { fontSize: 13.5, fontWeight: 600, color: "#1c2b29" },
   uploadHint: { fontSize: 12.5, color: "#7c9490", marginTop: 2, wordBreak: "break-all" },
   actionRow: { display: "flex", gap: 12, marginTop: 18, alignItems: "center" },
