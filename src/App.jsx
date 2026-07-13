@@ -1,8 +1,9 @@
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useEffect } from "react";
 import * as XLSX from "xlsx";
-import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves } from "lucide-react";
+import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw } from "lucide-react";
 
 const BAR_TO_MH2O = 10.19716;
+const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
 
 function normEUI(s) {
   return String(s || "").replace(/[^0-9a-fA-F]/g, "").toLowerCase();
@@ -72,8 +73,77 @@ function fmt(n, d = 2) {
   return n.toLocaleString("es-ES", { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 
+async function parseAssociationWorkbook(file) {
+  const assocWb = await readWorkbook(file);
+  const assocSheet = findSheetWithHeader(assocWb, [/dev\s*eui/i, /cable\s*fins\s*cota/i]);
+  if (!assocSheet) {
+    throw new Error('No encuentro una hoja con columnas "DEV EUI" y "Cable fins cota" en el archivo de asociación.');
+  }
+  const aHeaders = assocSheet.headers;
+  const euiIdx = findCol(aHeaders, [/dev\s*eui/i, /device_eui/i]);
+  const pozoIdx = findCol(aHeaders, [/c[oó]digo\s*pozo/i, /^codi$/i]);
+  const cotaIdx = findCol(aHeaders, [/^cota$/i]);
+  const cableIdx = findCol(aHeaders, [/cable\s*fins\s*cota/i]);
+
+  const assocMap = new Map();
+  const excluded = [];
+  for (let r = 1; r < assocSheet.rows.length; r++) {
+    const row = assocSheet.rows[r];
+    if (!row || !row.length) continue;
+    const euiRaw = row[euiIdx];
+    const eui = normEUI(euiRaw);
+    if (!eui) continue;
+    const pozo = (pozoIdx !== -1 ? row[pozoIdx] : null) || eui;
+    const cota = cotaIdx !== -1 ? parseFloat(String(row[cotaIdx]).replace(",", ".")) : null;
+    const cableRaw = cableIdx !== -1 ? row[cableIdx] : null;
+    const cable = parseCableFinsCota(cableRaw);
+    if (cable === null) {
+      excluded.push({ pozo, eui, motivo: cableRaw ? `valor no reconocido: "${cableRaw}"` : "sin valor" });
+      continue;
+    }
+    assocMap.set(eui, { pozo: String(pozo), cota, cable });
+  }
+  return { map: assocMap, excluded };
+}
+
+function loadAssocFromStorage() {
+  try {
+    const raw = localStorage.getItem(ASSOC_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return {
+      map: new Map(parsed.map),
+      excluded: parsed.excluded || [],
+      fileName: parsed.fileName,
+      savedAt: parsed.savedAt,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveAssocToStorage(data) {
+  try {
+    localStorage.setItem(
+      ASSOC_STORAGE_KEY,
+      JSON.stringify({
+        map: Array.from(data.map.entries()),
+        excluded: data.excluded,
+        fileName: data.fileName,
+        savedAt: data.savedAt,
+      })
+    );
+    return true;
+  } catch (e) {
+    return false; // p.ej. no disponible en la vista previa de Claude.ai
+  }
+}
+
 export default function App() {
-  const [assocFile, setAssocFile] = useState(null);
+  const [assocData, setAssocData] = useState(null); // { map, excluded, fileName, savedAt }
+  const [assocLoading, setAssocLoading] = useState(false);
+  const [assocError, setAssocError] = useState(null);
+  const [assocPersisted, setAssocPersisted] = useState(true);
   const [readingsFile, setReadingsFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -82,42 +152,40 @@ export default function App() {
   const [collapsed, setCollapsed] = useState({});
   const [showExcluded, setShowExcluded] = useState(false);
 
-  const process = useCallback(async (assoc, readings) => {
+  useEffect(() => {
+    const saved = loadAssocFromStorage();
+    if (saved) setAssocData(saved);
+  }, []);
+
+  const handleAssocFile = useCallback(async (file) => {
+    setAssocLoading(true);
+    setAssocError(null);
+    try {
+      const { map, excluded } = await parseAssociationWorkbook(file);
+      const data = { map, excluded, fileName: file.name, savedAt: new Date().toISOString() };
+      const persisted = saveAssocToStorage(data);
+      setAssocPersisted(persisted);
+      setAssocData(data);
+      setResults(null);
+    } catch (e) {
+      setAssocError(e.message || String(e));
+    } finally {
+      setAssocLoading(false);
+    }
+  }, []);
+
+  const clearAssocFile = () => {
+    try {
+      localStorage.removeItem(ASSOC_STORAGE_KEY);
+    } catch (e) {}
+    setAssocData(null);
+    setResults(null);
+  };
+
+  const process = useCallback(async (assocMap, assocExcluded, readings) => {
     setLoading(true);
     setError(null);
     try {
-      const assocWb = await readWorkbook(assoc);
-      const assocSheet = findSheetWithHeader(assocWb, [/dev\s*eui/i, /cable\s*fins\s*cota/i]);
-      if (!assocSheet) {
-        throw new Error(
-          'No encuentro una hoja con columnas "DEV EUI" y "Cable fins cota" en el archivo de asociación.'
-        );
-      }
-      const aHeaders = assocSheet.headers;
-      const euiIdx = findCol(aHeaders, [/dev\s*eui/i, /device_eui/i]);
-      const pozoIdx = findCol(aHeaders, [/c[oó]digo\s*pozo/i, /^codi$/i]);
-      const cotaIdx = findCol(aHeaders, [/^cota$/i]);
-      const cableIdx = findCol(aHeaders, [/cable\s*fins\s*cota/i]);
-
-      const assocMap = new Map();
-      const excluded = [];
-      for (let r = 1; r < assocSheet.rows.length; r++) {
-        const row = assocSheet.rows[r];
-        if (!row || !row.length) continue;
-        const euiRaw = row[euiIdx];
-        const eui = normEUI(euiRaw);
-        if (!eui) continue;
-        const pozo = (pozoIdx !== -1 ? row[pozoIdx] : null) || eui;
-        const cota = cotaIdx !== -1 ? parseFloat(String(row[cotaIdx]).replace(",", ".")) : null;
-        const cableRaw = cableIdx !== -1 ? row[cableIdx] : null;
-        const cable = parseCableFinsCota(cableRaw);
-        if (cable === null) {
-          excluded.push({ pozo, eui, motivo: cableRaw ? `valor no reconocido: "${cableRaw}"` : "sin valor" });
-          continue;
-        }
-        assocMap.set(eui, { pozo: String(pozo), cota, cable });
-      }
-
       const readWb = await readWorkbook(readings);
       const readSheet = findSheetWithHeader(readWb, [/dev\s*eui/i, /payload/i]);
       if (!readSheet) {
@@ -186,8 +254,8 @@ export default function App() {
 
       setResults({
         groups: groupList,
-        excluded: excluded.sort((a, b) => a.pozo.localeCompare(b.pozo)),
-        stats: { totalReadings, matchedReadings, decodedReadings, wellsOk: assocMap.size, wellsExcluded: excluded.length },
+        excluded: [...assocExcluded].sort((a, b) => a.pozo.localeCompare(b.pozo)),
+        stats: { totalReadings, matchedReadings, decodedReadings, wellsOk: assocMap.size, wellsExcluded: assocExcluded.length },
       });
     } catch (e) {
       setError(e.message || String(e));
@@ -201,7 +269,7 @@ export default function App() {
     if (f) setter(f);
   };
 
-  const canProcess = assocFile && readingsFile && !loading;
+  const canProcess = assocData && readingsFile && !loading;
 
   const filteredGroups = useMemo(() => {
     if (!results) return [];
@@ -256,13 +324,43 @@ export default function App() {
 
       <div style={styles.container}>
         <div style={styles.uploadRow}>
-          <UploadCard
-            label="1. Fitxer d'associació (pou ↔ DevEUI)"
-            hint="Excel amb columnes DEV EUI, Código pozo, COTA, Cable fins cota"
-            file={assocFile}
-            onChange={handleFile(setAssocFile)}
-            inputId="assoc-input"
-          />
+          {assocData ? (
+            <div style={styles.assocLoadedCard}>
+              <CheckCircle2 size={20} color="#2a8f6c" />
+              <div style={{ flex: 1 }}>
+                <div style={styles.uploadLabel}>Fitxer d'associació carregat</div>
+                <div style={styles.uploadHint}>
+                  {assocData.fileName} · desat el {new Date(assocData.savedAt).toLocaleString("es-ES")}
+                  {!assocPersisted && " · no s'ha pogut desar per a la propera visita"}
+                </div>
+              </div>
+              <label htmlFor="assoc-input" style={styles.smallLinkBtn}>
+                <RefreshCw size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+                Canviar
+              </label>
+              <input
+                id="assoc-input"
+                type="file"
+                accept=".xlsx,.xls"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) handleAssocFile(f);
+                }}
+              />
+            </div>
+          ) : (
+            <UploadCard
+              label="1. Fitxer d'associació (pou ↔ DevEUI)"
+              hint={assocLoading ? "Carregant…" : "Excel amb columnes DEV EUI, Código pozo, COTA, Cable fins cota"}
+              file={null}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleAssocFile(f);
+              }}
+              inputId="assoc-input"
+            />
+          )}
           <UploadCard
             label="2. Fitxer de lectures"
             hint="Excel export amb columnes DevEUI, Marca de temps, Payload (HEX)"
@@ -272,11 +370,17 @@ export default function App() {
           />
         </div>
 
+        {assocData && (
+          <button style={styles.tinyClearBtn} onClick={clearAssocFile}>
+            Eliminar fitxer d'associació desat
+          </button>
+        )}
+
         <div style={styles.actionRow}>
           <button
             style={{ ...styles.primaryBtn, ...(canProcess ? {} : styles.btnDisabled) }}
             disabled={!canProcess}
-            onClick={() => process(assocFile, readingsFile)}
+            onClick={() => process(assocData.map, assocData.excluded, readingsFile)}
           >
             {loading ? "Processant…" : "Processar dades"}
           </button>
@@ -288,10 +392,10 @@ export default function App() {
           )}
         </div>
 
-        {error && (
+        {(error || assocError) && (
           <div style={styles.errorBox}>
             <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: 2 }} />
-            <span>{error}</span>
+            <span>{error || assocError}</span>
           </div>
         )}
 
@@ -456,6 +560,37 @@ const styles = {
     transition: "border-color .15s",
   },
   uploadCardFilled: { borderColor: "#3e8e86", borderStyle: "solid" },
+  assocLoadedCard: {
+    flex: "1 1 320px",
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    background: "#f2faf6",
+    border: "1.5px solid #bfe3d0",
+    borderRadius: 10,
+    padding: "14px 16px",
+  },
+  smallLinkBtn: {
+    fontSize: 12.5,
+    fontWeight: 600,
+    color: "#1f5e59",
+    cursor: "pointer",
+    whiteSpace: "nowrap",
+    padding: "6px 10px",
+    border: "1px solid #cfe0dd",
+    borderRadius: 6,
+    background: "#fff",
+  },
+  tinyClearBtn: {
+    marginTop: 8,
+    background: "none",
+    border: "none",
+    color: "#a86a2d",
+    fontSize: 12,
+    cursor: "pointer",
+    padding: 0,
+    textDecoration: "underline",
+  },
   uploadLabel: { fontSize: 13.5, fontWeight: 600, color: "#1c2b29" },
   uploadHint: { fontSize: 12.5, color: "#7c9490", marginTop: 2, wordBreak: "break-all" },
   actionRow: { display: "flex", gap: 12, marginTop: 18, alignItems: "center" },
