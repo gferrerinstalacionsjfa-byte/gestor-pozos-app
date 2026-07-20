@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useCallback, useEffect } from "react";
 import * as XLSX from "xlsx";
-import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw } from "lucide-react";
+import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet } from "lucide-react";
 
 const BAR_TO_MH2O = 10.19716;
 const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
@@ -161,6 +161,8 @@ export default function App() {
   const [assocError, setAssocError] = useState(null);
   const [assocPersisted, setAssocPersisted] = useState(true);
   const [readingsFile, setReadingsFile] = useState(null);
+  const [readingsPreview, setReadingsPreview] = useState(null); // { rows, uniqueWells }
+  const [readingsPreviewError, setReadingsPreviewError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null); // { groups, excluded, stats }
@@ -219,6 +221,34 @@ export default function App() {
     setAssocData(null);
     setResults(null);
   };
+
+  const handleReadingsFile = useCallback(async (file) => {
+    setReadingsFile(file);
+    setResults(null);
+    setReadingsPreview(null);
+    setReadingsPreviewError(null);
+    try {
+      const wb = await readWorkbook(file);
+      const sheet = findSheetWithHeader(wb, [/dev\s*eui/i, /payload/i]);
+      if (!sheet) {
+        setReadingsPreviewError('No trobo columnes "DevEUI" i "Payload" en aquest fitxer.');
+        return;
+      }
+      const euiIdx = findCol(sheet.headers, [/dev\s*eui/i]);
+      const wells = new Set();
+      let rows = 0;
+      for (let r = 1; r < sheet.rows.length; r++) {
+        const row = sheet.rows[r];
+        if (!row || !row.length) continue;
+        rows++;
+        const eui = normEUI(row[euiIdx]);
+        if (eui) wells.add(eui);
+      }
+      setReadingsPreview({ rows, uniqueWells: wells.size });
+    } catch (e) {
+      setReadingsPreviewError(e.message || String(e));
+    }
+  }, []);
 
 
   const process = useCallback(async (assocMap, assocExcluded, readings) => {
@@ -303,11 +333,6 @@ export default function App() {
     }
   }, []);
 
-  const handleFile = (setter) => (e) => {
-    const f = e.target.files?.[0];
-    if (f) setter(f);
-  };
-
   const canProcess = assocData && readingsFile && !loading;
 
   const filteredGroups = useMemo(() => {
@@ -351,6 +376,17 @@ export default function App() {
 
   const toggle = (pozo) => setCollapsed((c) => ({ ...c, [pozo]: !c[pozo] }));
 
+  const allExpandedVisible = filteredGroups.length > 0 && filteredGroups.every((g) => !collapsed[g.pozo]);
+  const toggleAll = () => {
+    setCollapsed((c) => {
+      const next = { ...c };
+      filteredGroups.forEach((g) => {
+        next[g.pozo] = allExpandedVisible; // si tot estava desplegat, ara es plega tot
+      });
+      return next;
+    });
+  };
+
   return (
     <div style={styles.page}>
       <div style={styles.headerBar}>
@@ -374,6 +410,10 @@ export default function App() {
                   {assocData.fileName} · actualitzat el {new Date(assocData.savedAt).toLocaleString("es-ES")}
                   {!assocPersisted && " · no s'ha pogut desar còpia local per quan no hi hagi connexió"}
                 </div>
+                <div style={styles.uploadExtra}>
+                  <strong>{assocData.map.size}</strong> pous amb dades vàlides
+                  {assocData.excluded.length > 0 && ` · ${assocData.excluded.length} exclosos`}
+                </div>
               </div>
               <button style={styles.smallLinkBtn} onClick={() => syncFromSheet()} disabled={assocLoading}>
                 <RefreshCw size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
@@ -393,15 +433,25 @@ export default function App() {
           )}
           <UploadCard
             label="Fitxer de lectures"
-            hint="Excel export amb columnes DevEUI, Marca de temps, Payload (HEX)"
+            hint="Excel export amb columnes DevEUI, Marca de temps, Payload (HEX) — arrossega'l aquí o fes clic"
             file={readingsFile}
-            onChange={handleFile(setReadingsFile)}
+            onFile={handleReadingsFile}
             inputId="readings-input"
+            extra={
+              readingsPreviewError ? (
+                <span style={{ color: "#a86a2d" }}>{readingsPreviewError}</span>
+              ) : readingsPreview ? (
+                <span style={{ color: "#2a8f6c", fontWeight: 600 }}>
+                  {readingsPreview.rows} lectures · {readingsPreview.uniqueWells} pous diferents al fitxer
+                </span>
+              ) : null
+            }
           />
         </div>
 
         <div style={styles.manualUploadRow}>
-          <label htmlFor="assoc-input" style={styles.tinyClearBtn}>
+          <label htmlFor="assoc-input" style={styles.tinyDropZone}>
+            <FileSpreadsheet size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
             Pujar un fitxer d'associació manualment (en lloc de Google Sheets)
           </label>
           <input
@@ -449,14 +499,31 @@ export default function App() {
               <Stat label="Lectures decodificades" value={results.stats.decodedReadings} />
             </div>
 
-            <div style={styles.searchBar}>
-              <Search size={16} color="#7c9490" />
-              <input
-                style={styles.searchInput}
-                placeholder="Filtrar per codi de pou…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-              />
+            <div style={styles.searchRow}>
+              <div style={styles.searchBar}>
+                <Search size={16} color="#7c9490" />
+                <input
+                  style={styles.searchInput}
+                  placeholder="Filtrar per codi de pou…"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                />
+              </div>
+              {filteredGroups.length > 0 && (
+                <button style={styles.secondaryBtn} onClick={toggleAll}>
+                  {allExpandedVisible ? (
+                    <>
+                      <Minimize2 size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+                      Plegar tot
+                    </>
+                  ) : (
+                    <>
+                      <Maximize2 size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+                      Desplegar tot
+                    </>
+                  )}
+                </button>
+              )}
             </div>
 
             <div style={styles.groupsWrap}>
@@ -546,15 +613,44 @@ export default function App() {
   );
 }
 
-function UploadCard({ label, hint, file, onChange, inputId }) {
+function UploadCard({ label, hint, file, onFile, inputId, extra }) {
+  const [dragOver, setDragOver] = useState(false);
   return (
-    <label htmlFor={inputId} style={{ ...styles.uploadCard, ...(file ? styles.uploadCardFilled : {}) }}>
+    <label
+      htmlFor={inputId}
+      style={{
+        ...styles.uploadCard,
+        ...(file ? styles.uploadCardFilled : {}),
+        ...(dragOver ? styles.uploadCardDragOver : {}),
+      }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const f = e.dataTransfer.files?.[0];
+        if (f) onFile(f);
+      }}
+    >
       <Upload size={20} color={file ? "#3e8e86" : "#7c9490"} />
       <div style={{ flex: 1 }}>
         <div style={styles.uploadLabel}>{label}</div>
         <div style={styles.uploadHint}>{file ? file.name : hint}</div>
+        {extra && <div style={styles.uploadExtra}>{extra}</div>}
       </div>
-      <input id={inputId} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={onChange} />
+      <input
+        id={inputId}
+        type="file"
+        accept=".xlsx,.xls"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) onFile(f);
+        }}
+      />
     </label>
   );
 }
@@ -600,6 +696,19 @@ const styles = {
     transition: "border-color .15s",
   },
   uploadCardFilled: { borderColor: "#3e8e86", borderStyle: "solid" },
+  uploadCardDragOver: { borderColor: "#1f5e59", background: "#eef8f6", borderStyle: "solid" },
+  uploadExtra: { fontSize: 12, color: "#2a8f6c", marginTop: 4 },
+  tinyDropZone: {
+    display: "inline-flex",
+    alignItems: "center",
+    fontSize: 12,
+    color: "#4a615d",
+    cursor: "pointer",
+    padding: "6px 10px",
+    border: "1px dashed #cfe0dd",
+    borderRadius: 6,
+    background: "#fff",
+  },
   assocLoadedCard: {
     flex: "1 1 320px",
     display: "flex",
@@ -678,7 +787,6 @@ const styles = {
   statValue: { fontSize: 22, fontWeight: 700 },
   statLabel: { fontSize: 11.5, color: "#7c9490", marginTop: 2 },
   searchBar: {
-    marginTop: 22,
     display: "flex",
     alignItems: "center",
     gap: 8,
@@ -687,7 +795,9 @@ const styles = {
     borderRadius: 8,
     padding: "8px 12px",
     maxWidth: 320,
+    flex: "1 1 260px",
   },
+  searchRow: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginTop: 22 },
   searchInput: { border: "none", outline: "none", fontSize: 13.5, flex: 1, background: "transparent" },
   groupsWrap: { marginTop: 16, display: "flex", flexDirection: "column", gap: 10 },
   emptyMsg: { color: "#7c9490", fontSize: 13.5, padding: "20px 0" },
