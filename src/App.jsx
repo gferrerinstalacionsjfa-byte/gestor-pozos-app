@@ -1,11 +1,13 @@
 import React, { useState, useMemo, useCallback, useEffect } from "react";
 import * as XLSX from "xlsx";
-import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet } from "lucide-react";
+import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
 
 const BAR_TO_MH2O = 10.19716;
 const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
 const ASSOC_CSV_URL =
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vQAi-_8-SD1mogQMDKb5j2kfl0xzJub5kXE1F0YTnkVV_qiBBjYFfTOTRsE-_ylRNcTxu9vKbswww2W/pub?gid=1661818251&single=true&output=csv";
+// DevEUI que no corresponen a pous reals i s'han d'ignorar sempre
+const IGNORED_EUIS = new Set(["24e124847f420841"]); // mesurador de cobertura
 
 function normEUI(s) {
   return String(s || "").replace(/[^0-9a-fA-F]/g, "").toLowerCase();
@@ -169,6 +171,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState({});
   const [showExcluded, setShowExcluded] = useState(false);
+  const [showNoSignal, setShowNoSignal] = useState(false);
 
   const syncFromSheet = useCallback(async ({ silent } = {}) => {
     if (!silent) setAssocLoading(true);
@@ -242,7 +245,7 @@ export default function App() {
         if (!row || !row.length) continue;
         rows++;
         const eui = normEUI(row[euiIdx]);
-        if (eui) wells.add(eui);
+        if (eui && !IGNORED_EUIS.has(eui)) wells.add(eui);
       }
       setReadingsPreview({ rows, uniqueWells: wells.size });
     } catch (e) {
@@ -266,6 +269,7 @@ export default function App() {
       const rPayloadIdx = findCol(rHeaders, [/payload/i]);
 
       const groups = new Map(); // pozo -> date -> {pressures,temps,conds,nivels,count}
+      const euisInFile = new Set();
       let totalReadings = 0;
       let matchedReadings = 0;
       let decodedReadings = 0;
@@ -274,8 +278,9 @@ export default function App() {
         const row = readSheet.rows[r];
         if (!row || !row.length) continue;
         const eui = normEUI(row[rEuiIdx]);
-        if (!eui) continue;
+        if (!eui || IGNORED_EUIS.has(eui)) continue;
         totalReadings++;
+        euisInFile.add(eui);
         const info = assocMap.get(eui);
         if (!info) continue;
         matchedReadings++;
@@ -299,6 +304,14 @@ export default function App() {
         if (decoded.condMScm !== undefined) bucket.conds.push(decoded.condMScm);
         bucket.nivels.push(nivel);
       }
+
+      const noSignal = [];
+      for (const [eui, info] of assocMap.entries()) {
+        if (!euisInFile.has(eui)) {
+          noSignal.push({ pozo: info.pozo, eui, cota: info.cota, cable: info.cable });
+        }
+      }
+      noSignal.sort((a, b) => a.pozo.localeCompare(b.pozo));
 
       const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
 
@@ -324,7 +337,15 @@ export default function App() {
       setResults({
         groups: groupList,
         excluded: [...assocExcluded].sort((a, b) => a.pozo.localeCompare(b.pozo)),
-        stats: { totalReadings, matchedReadings, decodedReadings, wellsOk: assocMap.size, wellsExcluded: assocExcluded.length },
+        noSignal,
+        stats: {
+          totalReadings,
+          matchedReadings,
+          decodedReadings,
+          wellsOk: assocMap.size,
+          wellsExcluded: assocExcluded.length,
+          wellsNoSignal: noSignal.length,
+        },
       });
     } catch (e) {
       setError(e.message || String(e));
@@ -365,6 +386,12 @@ export default function App() {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Nivel freático");
 
+    if (results.noSignal.length) {
+      const wsNoSignal = XLSX.utils.json_to_sheet(
+        results.noSignal.map((x) => ({ Pozo: x.pozo, DevEUI: x.eui, "Cota (m)": x.cota, "Cable fins cota (m)": x.cable }))
+      );
+      XLSX.utils.book_append_sheet(wb, wsNoSignal, "Sin señal");
+    }
     if (results.excluded.length) {
       const wsExc = XLSX.utils.json_to_sheet(
         results.excluded.map((x) => ({ Pozo: x.pozo, DevEUI: x.eui, Motivo: x.motivo }))
@@ -494,6 +521,7 @@ export default function App() {
             <div style={styles.statsRow}>
               <Stat label="Pous amb cota vàlida" value={results.stats.wellsOk} />
               <Stat label="Pous exclosos" value={results.stats.wellsExcluded} warn />
+              <Stat label="Pous instal·lats sense senyal" value={results.stats.wellsNoSignal} warn />
               <Stat label="Lectures totals" value={results.stats.totalReadings} />
               <Stat label="Lectures amb pou associat" value={results.stats.matchedReadings} />
               <Stat label="Lectures decodificades" value={results.stats.decodedReadings} />
@@ -574,6 +602,40 @@ export default function App() {
                 </div>
               ))}
             </div>
+
+            {results.noSignal.length > 0 && (
+              <div style={styles.noSignalBox}>
+                <button style={styles.noSignalHeader} onClick={() => setShowNoSignal((s) => !s)}>
+                  {showNoSignal ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  <RadioTower size={15} color="#b03a3a" style={{ margin: "0 6px" }} />
+                  {results.noSignal.length} pous instal·lats (amb cota vàlida) que no han emès cap lectura en aquest fitxer
+                </button>
+                {showNoSignal && (
+                  <div style={styles.tableWrap}>
+                    <table style={styles.table}>
+                      <thead>
+                        <tr>
+                          <th style={styles.th}>Pou</th>
+                          <th style={styles.th}>DevEUI</th>
+                          <th style={styles.th}>Cota</th>
+                          <th style={styles.th}>Cable fins cota</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {results.noSignal.map((x, i) => (
+                          <tr key={i}>
+                            <td style={styles.td}>{x.pozo}</td>
+                            <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{x.eui}</td>
+                            <td style={styles.td}>{fmt(x.cota, 1)} m</td>
+                            <td style={styles.td}>{fmt(x.cable, 2)} m</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
 
             {results.excluded.length > 0 && (
               <div style={styles.excludedBox}>
@@ -830,6 +892,20 @@ const styles = {
   },
   td: { padding: "9px 14px", borderBottom: "1px solid #f0f5f4" },
   excludedBox: { marginTop: 22, background: "#fffaf3", border: "1px solid #f0d9b5", borderRadius: 10, overflow: "hidden" },
+  noSignalBox: { marginTop: 22, background: "#fdf2f2", border: "1px solid #f0c4c4", borderRadius: 10, overflow: "hidden" },
+  noSignalHeader: {
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    background: "transparent",
+    border: "none",
+    padding: "12px 16px",
+    cursor: "pointer",
+    fontSize: 13.5,
+    fontWeight: 600,
+    color: "#b03a3a",
+    textAlign: "left",
+  },
   excludedHeader: {
     width: "100%",
     display: "flex",
