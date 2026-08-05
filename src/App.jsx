@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback, useEffect } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
 import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
 
@@ -172,6 +172,12 @@ export default function App() {
   const [collapsed, setCollapsed] = useState({});
   const [showExcluded, setShowExcluded] = useState(false);
   const [showNoSignal, setShowNoSignal] = useState(false);
+  const noSignalRef = useRef(null);
+
+  const jumpToNoSignal = () => {
+    setShowNoSignal(true);
+    setTimeout(() => noSignalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+  };
 
   const syncFromSheet = useCallback(async ({ silent } = {}) => {
     if (!silent) setAssocLoading(true);
@@ -521,7 +527,7 @@ export default function App() {
             <div style={styles.statsRow}>
               <Stat label="Pous amb cota vàlida" value={results.stats.wellsOk} />
               <Stat label="Pous exclosos" value={results.stats.wellsExcluded} warn />
-              <Stat label="Pous instal·lats sense senyal" value={results.stats.wellsNoSignal} warn />
+              <Stat label="Pous instal·lats sense senyal" value={results.stats.wellsNoSignal} warn onClick={results.stats.wellsNoSignal > 0 ? jumpToNoSignal : undefined} />
               <Stat label="Lectures totals" value={results.stats.totalReadings} />
               <Stat label="Lectures amb pou associat" value={results.stats.matchedReadings} />
               <Stat label="Lectures decodificades" value={results.stats.decodedReadings} />
@@ -604,7 +610,7 @@ export default function App() {
             </div>
 
             {results.noSignal.length > 0 && (
-              <div style={styles.noSignalBox}>
+              <div style={styles.noSignalBox} ref={noSignalRef}>
                 <button style={styles.noSignalHeader} onClick={() => setShowNoSignal((s) => !s)}>
                   {showNoSignal ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
                   <RadioTower size={15} color="#b03a3a" style={{ margin: "0 6px" }} />
@@ -717,9 +723,15 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
   );
 }
 
-function Stat({ label, value, warn }) {
+function Stat({ label, value, warn, onClick }) {
+  const clickable = typeof onClick === "function";
   return (
-    <div style={styles.statCard}>
+    <div
+      style={{ ...styles.statCard, ...(clickable ? styles.statCardClickable : {}) }}
+      onClick={onClick}
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+    >
       <div style={{ ...styles.statValue, color: warn && value > 0 ? "#a86a2d" : "#1f4b46" }}>{value}</div>
       <div style={styles.statLabel}>{label}</div>
     </div>
@@ -846,6 +858,7 @@ const styles = {
     padding: "12px 18px",
     minWidth: 130,
   },
+  statCardClickable: { cursor: "pointer", transition: "box-shadow .15s, border-color .15s" },
   statValue: { fontSize: 22, fontWeight: 700 },
   statLabel: { fontSize: 11.5, color: "#7c9490", marginTop: 2 },
   searchBar: {
