@@ -677,6 +677,10 @@ export default function App() {
           </>
         )}
       </div>
+
+      <footer style={styles.footer}>
+        © {new Date().getFullYear()} Instal·lacions JFA. Tots els drets reservats.
+      </footer>
     </div>
   );
 }
@@ -744,6 +748,16 @@ const styles = {
     background: "#f4f8f7",
     fontFamily: "'Segoe UI', Roboto, -apple-system, sans-serif",
     color: "#1c2b29",
+    display: "flex",
+    flexDirection: "column",
+  },
+  footer: {
+    marginTop: "auto",
+    textAlign: "center",
+    padding: "18px 20px",
+    fontSize: 12,
+    color: "#7c9490",
+    borderTop: "1px solid #e1ecea",
   },
   headerBar: {
     background: "linear-gradient(120deg, #123c3a, #1f5e59)",
