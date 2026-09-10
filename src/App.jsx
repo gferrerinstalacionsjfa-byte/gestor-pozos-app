@@ -166,6 +166,7 @@ async function parseMuntatgesFromWorkbook(assocWb) {
   const pozoIdx = findCol(headers, [/c[oó]digo\s*pozo/i, /^codi$/i]);
   const euiIdx = findCol(headers, [/dev\s*eui/i]);
   const cotaIdx = findCol(headers, [/^cota$/i]);
+  const cableIdx = findCol(headers, [/cable\s*fins\s*cota/i]);
   const installerIdx = findCol(headers, [/instal·?lador/i, /instalador/i]);
   const dateIdx = findCol(headers, [/data\s*de\s*muntatge/i]);
   const acabatIdx = findCol(headers, [/^acabat$/i]);
@@ -176,10 +177,13 @@ async function parseMuntatgesFromWorkbook(assocWb) {
     if (!row || !row.length) continue;
     const pozo = pozoIdx !== -1 ? row[pozoIdx] : null;
     if (!pozo) continue;
+    const cable = cableIdx !== -1 ? parseCableFinsCota(row[cableIdx]) : null;
+    if (cable === null) continue; // solo pozos con medida de cable válida
     rows.push({
       pozo: String(pozo),
       eui: euiIdx !== -1 ? normEUI(row[euiIdx]) : "",
       cota: cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null,
+      cable,
       installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
       date: dateIdx !== -1 ? String(row[dateIdx] || "").trim() : "",
       acabat: acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "",
@@ -231,6 +235,8 @@ function MuntatgesView() {
   const [lastByEui, setLastByEui] = useState(null);
   const [readingsError, setReadingsError] = useState(null);
   const [readingsLoading, setReadingsLoading] = useState(false);
+  const [sortDir, setSortDir] = useState("desc"); // "desc" = més recent primer
+  const [collapsed, setCollapsed] = useState({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -265,22 +271,35 @@ function MuntatgesView() {
     }
   }, []);
 
-  const filtered = useMemo(() => {
-    if (!rows) return [];
-    const q = query.trim().toLowerCase();
-    const list = q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
-    return [...list].sort((a, b) => {
+  const dateSorter = useCallback(
+    (a, b) => {
       const da = parseMuntatgeDate(a.date);
       const db = parseMuntatgeDate(b.date);
-      if (da && db) return db - da; // més recent primer
+      if (da && db) return sortDir === "desc" ? db - da : da - db;
       if (da) return -1;
       if (db) return 1;
       return a.pozo.localeCompare(b.pozo);
-    });
-  }, [rows, query]);
+    },
+    [sortDir]
+  );
 
-  const muntats = filtered.filter((r) => parseMuntatgeDate(r.date));
-  const pendents = filtered.filter((r) => !parseMuntatgeDate(r.date));
+  const groups = useMemo(() => {
+    if (!rows) return [];
+    const q = query.trim().toLowerCase();
+    const list = q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
+    const byInstaller = new Map();
+    for (const r of list) {
+      const key = r.installer || "Sense instal·lador assignat";
+      if (!byInstaller.has(key)) byInstaller.set(key, []);
+      byInstaller.get(key).push(r);
+    }
+    return Array.from(byInstaller.entries())
+      .map(([installer, wells]) => ({ installer, wells: [...wells].sort(dateSorter) }))
+      .sort((a, b) => a.installer.localeCompare(b.installer));
+  }, [rows, query, dateSorter]);
+
+  const pendents = useMemo(() => (rows || []).filter((r) => !parseMuntatgeDate(r.date)), [rows]);
+  const toggle = (installer) => setCollapsed((c) => ({ ...c, [installer]: !c[installer] }));
 
   return (
     <div style={styles.page}>
@@ -289,7 +308,7 @@ function MuntatgesView() {
           <Waves size={22} color="#e8f3f2" />
           <span style={styles.brandText}>Muntatges</span>
         </div>
-        <span style={styles.brandSub}>Data de muntatge i instal·lador per pou</span>
+        <span style={styles.brandSub}>Data de muntatge i instal·lador, pous amb cable fins cota mesurat</span>
       </div>
 
       <div style={styles.container}>
@@ -320,6 +339,10 @@ function MuntatgesView() {
               onChange={(e) => setQuery(e.target.value)}
             />
           </div>
+          <button style={styles.secondaryBtn} onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}>
+            <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            {sortDir === "desc" ? "Més recent primer" : "Més antic primer"}
+          </button>
           <button style={styles.secondaryBtn} onClick={load} disabled={loading}>
             <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
             {loading ? "Actualitzant…" : "Actualitzar ara"}
@@ -336,51 +359,59 @@ function MuntatgesView() {
         {rows && (
           <>
             <div style={styles.statsRow}>
-              <Stat label="Pous muntats" value={muntats.length} />
-              <Stat label="Pendents de muntar" value={pendents.length} />
-              <Stat label="Total pous al full" value={rows.length} />
+              <Stat label="Pous amb cable vàlid" value={rows.length} />
+              <Stat label="Pendents de muntar" value={pendents.length} warn />
+              <Stat label="Instal·ladors" value={groups.length} />
             </div>
 
-            <div style={{ ...styles.groupCard, marginTop: 22 }}>
-              <div style={styles.tableWrap}>
-                <table style={styles.table}>
-                  <thead>
-                    <tr>
-                      <th style={styles.th}>Pou</th>
-                      <th style={styles.th}>Cota</th>
-                      <th style={styles.th}>Instal·lador</th>
-                      <th style={styles.th}>Data de muntatge</th>
-                      <th style={styles.th}>Acabat</th>
-                      {lastByEui && <th style={styles.th}>Última lectura real</th>}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filtered.map((r, i) => {
-                      const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
-                      return (
-                        <tr key={i}>
-                          <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
-                          <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
-                          <td style={styles.td}>{r.installer || "—"}</td>
-                          <td style={styles.td}>{r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}</td>
-                          <td style={styles.td}>{r.acabat || "—"}</td>
-                          {lastByEui && (
-                            <td style={styles.td}>
-                              {!r.eui ? (
-                                "—"
-                              ) : activity && activity.lastReal ? (
-                                <span style={{ color: "#2a8f6c" }}>{activity.lastReal.slice(0, 16).replace("T", " ")}</span>
-                              ) : (
-                                <span style={{ color: "#b03a3a" }}>sense lectures reals</span>
-                              )}
-                            </td>
-                          )}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+            <div style={styles.groupsWrap}>
+              {groups.map((g) => (
+                <div key={g.installer} style={styles.groupCard}>
+                  <button style={styles.groupHeader} onClick={() => toggle(g.installer)}>
+                    {collapsed[g.installer] ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+                    <CheckCircle2 size={16} color="#3e8e86" style={{ marginRight: 6 }} />
+                    <span style={styles.groupTitle}>{g.installer}</span>
+                    <span style={styles.groupMeta}>{g.wells.length} pous</span>
+                  </button>
+                  {!collapsed[g.installer] && (
+                    <div style={styles.tableWrap}>
+                      <table style={styles.table}>
+                        <thead>
+                          <tr>
+                            <th style={styles.th}>Pou</th>
+                            <th style={styles.th}>Data de muntatge</th>
+                            {lastByEui && <th style={styles.th}>Última lectura real</th>}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {g.wells.map((r, i) => {
+                            const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+                            return (
+                              <tr key={i}>
+                                <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                                <td style={styles.td}>
+                                  {r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}
+                                </td>
+                                {lastByEui && (
+                                  <td style={styles.td}>
+                                    {!r.eui ? (
+                                      "—"
+                                    ) : activity && activity.lastReal ? (
+                                      <span style={{ color: "#2a8f6c" }}>{activity.lastReal.slice(0, 16).replace("T", " ")}</span>
+                                    ) : (
+                                      <span style={{ color: "#b03a3a" }}>sense lectures reals</span>
+                                    )}
+                                  </td>
+                                )}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           </>
         )}
