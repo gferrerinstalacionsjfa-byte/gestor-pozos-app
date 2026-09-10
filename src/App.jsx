@@ -239,7 +239,19 @@ function formatMuntatgeDate(d) {
 function normalizeMuntatgeDateString(raw) {
   const s = String(raw || "").trim();
   if (!s) return "";
-  if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(s)) return s; // ja ve en format dd/mm/aaaa
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(.*)$/);
+  if (m) {
+    let day = Number(m[1]);
+    let month = Number(m[2]);
+    const rest = m[4] || "";
+    // si el "mes" no pot ser-ho (>12) però el "dia" sí, és que ve escrit mes/dia -> es capgira
+    if (month > 12 && day <= 12) {
+      [day, month] = [month, day];
+    }
+    // si els dos números són <=12 és ambigu: es manté l'ordre tal com ve (dia/mes, conveni majoritari al full)
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(day)}/${pad(month)}/${m[3]}${rest}`;
+  }
   // número de sèrie de data del full de càlcul (dies des del 30/12/1899), a vegades amb decimals d'hora
   const num = Number(s);
   if (!Number.isNaN(num) && num > 1000 && num < 100000) {
@@ -274,7 +286,7 @@ function MuntatgesView() {
   const [readingsError, setReadingsError] = useState(null);
   const [readingsLoading, setReadingsLoading] = useState(false);
   const [groupBy, setGroupBy] = useState("installer"); // "installer" | "illa" | "none"
-  const [sortField, setSortField] = useState("muntatge"); // "muntatge" | "lectura"
+  const [sortField, setSortField] = useState(null); // null | "muntatge" | "lectura"
   const [sortDir, setSortDir] = useState("desc"); // "desc" | "asc"
   const [collapsed, setCollapsed] = useState({});
 
@@ -311,10 +323,25 @@ function MuntatgesView() {
     }
   }, []);
 
-  // si es tria ordenar per última lectura però encara no hi ha fitxer carregat, es torna a "muntatge"
+  // si es queda sense fitxer de lectures mentre s'ordenava per última lectura, es treu l'ordre
   useEffect(() => {
-    if (sortField === "lectura" && !lastByEui) setSortField("muntatge");
+    if (sortField === "lectura" && !lastByEui) setSortField(null);
   }, [lastByEui, sortField]);
+
+  // clic a una capçalera ordenable: 1r clic -> desc (▾), 2n clic -> asc (▴), 3r clic -> treu l'ordre
+  const toggleSort = (field) => {
+    setSortField((current) => {
+      if (current !== field) {
+        setSortDir("desc");
+        return field;
+      }
+      if (sortDir === "desc") {
+        setSortDir("asc");
+        return field;
+      }
+      return null; // 3r clic: treu el filtre d'ordre
+    });
+  };
 
   const sortValue = useCallback(
     (r) => {
@@ -322,22 +349,25 @@ function MuntatgesView() {
         const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
         return activity && activity.lastReal ? new Date(activity.lastReal) : null;
       }
-      return parseMuntatgeDate(r.date);
+      if (sortField === "muntatge") return parseMuntatgeDate(r.date);
+      return null;
     },
     [sortField, lastByEui]
   );
 
   const sortWells = useCallback(
-    (wells) =>
-      [...wells].sort((a, b) => {
+    (wells) => {
+      if (!sortField) return [...wells].sort((a, b) => a.pozo.localeCompare(b.pozo));
+      return [...wells].sort((a, b) => {
         const va = sortValue(a);
         const vb = sortValue(b);
         if (va && vb) return sortDir === "desc" ? vb - va : va - vb;
         if (va) return -1;
         if (vb) return 1;
         return a.pozo.localeCompare(b.pozo);
-      }),
-    [sortValue, sortDir]
+      });
+    },
+    [sortValue, sortDir, sortField]
   );
 
   const filteredRows = useMemo(() => {
@@ -372,12 +402,12 @@ function MuntatgesView() {
     doc.setTextColor(120);
     doc.text(`Generat el ${new Date().toLocaleString("es-ES")}`, 14, 21);
 
-    const head = [["Pou", "Illa", "Remesa", "Instal·lador", "Data de muntatge", ...(lastByEui ? ["Última lectura real"] : [])]];
+    const head = [["Pou", "DevEUI", "Illa", "Remesa", "Instal·lador", "Data de muntatge", ...(lastByEui ? ["Última lectura real"] : [])]];
     const body = [];
     groups.forEach((g) => {
       sortWells(g.wells).forEach((r) => {
         const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
-        const row = [r.pozo, getIlla(r.pozo), r.remesa || "—", r.installer || "—", r.date || "pendent"];
+        const row = [r.pozo, r.eui ? r.eui.toUpperCase() : "—", getIlla(r.pozo), r.remesa || "—", r.installer || "—", r.date || "pendent"];
         if (lastByEui) {
           row.push(!r.eui ? "—" : activity && activity.lastReal ? activity.lastReal.slice(0, 16).replace("T", " ") : "sense lectures reals");
         }
@@ -434,31 +464,6 @@ function MuntatgesView() {
               </button>
             ))}
           </div>
-
-          <div style={styles.segmentGroup}>
-            <span style={styles.segmentLabel}>Ordenar per:</span>
-            <button
-              style={{ ...styles.segmentBtn, ...(sortField === "muntatge" ? styles.segmentBtnActive : {}) }}
-              onClick={() => setSortField("muntatge")}
-            >
-              Data de muntatge
-            </button>
-            <button
-              style={{
-                ...styles.segmentBtn,
-                ...(sortField === "lectura" ? styles.segmentBtnActive : {}),
-                ...(!lastByEui ? styles.segmentBtnDisabled : {}),
-              }}
-              onClick={() => lastByEui && setSortField("lectura")}
-              disabled={!lastByEui}
-              title={!lastByEui ? "Puja un fitxer de lectures per activar aquest ordre" : ""}
-            >
-              Última lectura real
-            </button>
-            <button style={styles.segmentBtn} onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}>
-              {sortDir === "desc" ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
-            </button>
-          </div>
         </div>
 
         <div style={styles.searchRow}>
@@ -513,11 +518,36 @@ function MuntatgesView() {
                         <thead>
                           <tr>
                             <th style={styles.th}>Pou</th>
+                            <th style={styles.th}>DevEUI</th>
                             {groupBy !== "illa" && <th style={styles.th}>Illa</th>}
                             <th style={styles.th}>Remesa</th>
                             {groupBy !== "installer" && <th style={styles.th}>Instal·lador</th>}
-                            <th style={styles.th}>Data de muntatge</th>
-                            {lastByEui && <th style={styles.th}>Última lectura real</th>}
+                            <th
+                              style={{ ...styles.th, cursor: "pointer", userSelect: "none" }}
+                              onClick={() => toggleSort("muntatge")}
+                            >
+                              Data de muntatge
+                              {sortField === "muntatge" &&
+                                (sortDir === "desc" ? (
+                                  <ChevronDown size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                ) : (
+                                  <ChevronUp size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                ))}
+                            </th>
+                            {lastByEui && (
+                              <th
+                                style={{ ...styles.th, cursor: "pointer", userSelect: "none" }}
+                                onClick={() => toggleSort("lectura")}
+                              >
+                                Última lectura real
+                                {sortField === "lectura" &&
+                                  (sortDir === "desc" ? (
+                                    <ChevronDown size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                  ) : (
+                                    <ChevronUp size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                  ))}
+                              </th>
+                            )}
                           </tr>
                         </thead>
                         <tbody>
@@ -526,6 +556,9 @@ function MuntatgesView() {
                             return (
                               <tr key={i}>
                                 <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                                <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>
+                                  {r.eui ? r.eui.toUpperCase() : "—"}
+                                </td>
                                 {groupBy !== "illa" && <td style={styles.td}>{getIlla(r.pozo)}</td>}
                                 <td style={styles.td}>{r.remesa || "—"}</td>
                                 {groupBy !== "installer" && <td style={styles.td}>{r.installer || "—"}</td>}
