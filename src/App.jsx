@@ -33,28 +33,150 @@ function findCol(headers, patterns) {
 
 function decodePayload(hex) {
   if (!hex || typeof hex !== "string") return null;
-  const clean = hex.replace(/\s/g, "");
-  if (!/^[0-9a-fA-F]+$/.test(clean) || clean.length < 16) return null;
+  const clean = hex.replace(/\s/g, "").toUpperCase();
+  if (!/^[0-9A-F]+$/.test(clean) || clean.length < 4) return null;
   const bytes = [];
   for (let i = 0; i < clean.length; i += 2) bytes.push(parseInt(clean.substr(i, 2), 16));
+  const len = bytes.length;
 
-  const out = {};
-  for (let i = 0; i + 8 <= bytes.length; i++) {
-    if (bytes[i] === 0xff && bytes[i + 1] === 0x0e) {
+  const readFloat32LE = (offset) => {
+    if (offset + 4 > len) return null;
+    const buf = new ArrayBuffer(4);
+    const view = new DataView(buf);
+    for (let k = 0; k < 4; k++) view.setUint8(k, bytes[offset + k]);
+    const val = view.getFloat32(0, true);
+    return Number.isFinite(val) ? val : null;
+  };
+  const readUint32LE = (offset) => {
+    if (offset + 4 > len) return null;
+    return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+  };
+  const readUint16LE = (offset) => {
+    if (offset + 2 > len) return null;
+    return bytes[offset] | (bytes[offset + 1] << 8);
+  };
+
+  const out = { errors: [], deviceInfo: null, ack: null, historical: [] };
+
+  // --- Comandos / ACK (comença per FE) ---
+  if (bytes[0] === 0xfe) {
+    const code = bytes[1];
+    if (code === 0x02) out.ack = `ACK collecting interval: ${readUint16LE(2)} s`;
+    else if (code === 0x03) out.ack = `ACK reporting interval: ${readUint16LE(2)} s`;
+    else if (code === 0x68) out.ack = `ACK Data Storage: ${bytes[2] === 0x01 ? "activat" : "desactivat"}`;
+    else if (code === 0x69) out.ack = `ACK Data Retransmission: ${bytes[2] === 0x01 ? "activada" : "desactivada"}`;
+    else if (code === 0x6a) out.ack = "ACK comando FF6A";
+    else if (code === 0x10) out.ack = "ACK reinici UC502";
+    else if (code === 0x28) out.ack = "ACK petició de dada actual";
+    else out.ack = `Resposta/ACK UC502: ${clean}`;
+  }
+
+  // --- GPIO ---
+  if (bytes[0] === 0x03 && bytes[1] === 0x00) out.gpio1 = bytes[2];
+  if (bytes[3] === 0x04 && bytes[4] === 0x00) out.gpio2 = bytes[5];
+
+  // --- Bateria (últims 3 bytes: 01 75 XX) ---
+  if (len >= 3 && bytes[len - 3] === 0x01 && bytes[len - 2] === 0x75) {
+    out.battery = bytes[len - 1];
+  }
+
+  // --- Errors RS485/Modbus i lectures en viu (FF0E = dada, FF15 = error) ---
+  for (let i = 0; i + 3 <= len; i++) {
+    if (bytes[i] === 0xff && (bytes[i + 1] === 0x0e || bytes[i + 1] === 0x15)) {
       const channel = bytes[i + 2];
-      const buf = new ArrayBuffer(4);
-      const view = new DataView(buf);
-      for (let k = 0; k < 4; k++) view.setUint8(k, bytes[i + 4 + k]);
-      const val = view.getFloat32(0, true); // little-endian
-      if (Number.isFinite(val)) {
-        if (channel === 7) out.pressureBar = val;
-        else if (channel === 8) out.tempC = val;
-        else if (channel === 9) out.condMScm = val;
+      if (bytes[i + 1] === 0x15) {
+        if (channel === 7) out.errors.push("presió");
+        else if (channel === 8) out.errors.push("temperatura");
+        else if (channel === 9) out.errors.push("conductivitat");
+        i += 2;
+        continue;
       }
-      i += 7; // skip consumed bytes (loop will +1 more)
+      if (bytes[i + 3] === 0x25) {
+        const val = readFloat32LE(i + 4);
+        if (val !== null) {
+          if (channel === 7) out.pressureBar = val;
+          else if (channel === 8) out.tempC = val;
+          else if (channel === 9) out.condMScm = val;
+        }
+        i += 7;
+      }
     }
   }
-  return Object.keys(out).length ? out : null;
+
+  // --- Informació del dispositiu ---
+  for (let i = 0; i + 2 <= len; i++) {
+    if (bytes[i] !== 0xff) continue;
+    const code = bytes[i + 1];
+    if (code === 0x0b) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.powerOn = true;
+    } else if (code === 0x16 && i + 10 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.serial = bytes
+        .slice(i + 2, i + 10)
+        .map((b) => b.toString(16).padStart(2, "0").toUpperCase())
+        .join("");
+    } else if (code === 0x09 && i + 4 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.firmware = `${bytes[i + 2]}.${bytes[i + 3]}`;
+    } else if (code === 0x0a && i + 4 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.hardware = `${String(bytes[i + 2]).padStart(2, "0")}.${String(bytes[i + 3]).padStart(2, "0")}`;
+    } else if (code === 0x0f && i + 3 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.classType = bytes[i + 2] === 0x00 ? "Class A" : "Desconeguda";
+    }
+  }
+
+  // --- Històrics 20DC / 20DD ---
+  for (let i = 0; i + 2 <= len; i++) {
+    if (bytes[i] === 0x20 && bytes[i + 1] === 0xdc) {
+      const ts = readUint32LE(i + 2);
+      if (ts !== null) out.historical.push({ timestamp: new Date(ts * 1000), type: "20DC" });
+    } else if (bytes[i] === 0x20 && bytes[i + 1] === 0xdd) {
+      const ts = readUint32LE(i + 2);
+      const mask = readUint16LE(i + 6);
+      if (ts === null || mask === null) continue;
+      const rec = { timestamp: new Date(ts * 1000), type: "20DD" };
+      let offset = i + 8;
+      if (mask & 1) {
+        if (bytes[offset] === 0x25) {
+          const v = readFloat32LE(offset + 1);
+          if (v !== null) rec.pressureBar = v;
+        }
+        offset += 5;
+      }
+      if (mask & 2) {
+        if (bytes[offset] === 0x25) {
+          const v = readFloat32LE(offset + 1);
+          if (v !== null) rec.tempC = v;
+        }
+        offset += 5;
+      }
+      if (mask & 4) {
+        if (bytes[offset] === 0x25) {
+          const v = readFloat32LE(offset + 1);
+          if (v !== null) rec.condMScm = v;
+        }
+        offset += 5;
+      }
+      out.historical.push(rec);
+    }
+  }
+
+  const hasAnything =
+    out.pressureBar !== undefined ||
+    out.tempC !== undefined ||
+    out.condMScm !== undefined ||
+    out.battery !== undefined ||
+    out.gpio1 !== undefined ||
+    out.gpio2 !== undefined ||
+    out.errors.length ||
+    out.deviceInfo ||
+    out.ack ||
+    out.historical.length;
+
+  return hasAnything ? out : null;
 }
 
 function findSheetWithHeader(workbook, patterns) {
@@ -206,7 +328,17 @@ async function parseLastReadingByEui(file) {
   const tsIdx = findCol(sheet.headers, [/marca\s*de\s*temps/i, /timestamp/i]);
   const payloadIdx = findCol(sheet.headers, [/payload/i]);
 
-  const lastByEui = new Map(); // eui -> { lastAny, lastReal }
+  const lastByEui = new Map(); // eui -> { lastAny, lastReal, battery, errors, gpio1, gpio2, deviceInfo }
+  const deviceInfoSummary = (d) => {
+    if (!d) return null;
+    const parts = [];
+    if (d.serial) parts.push(`Sèrie ${d.serial}`);
+    if (d.firmware) parts.push(`FW ${d.firmware}`);
+    if (d.hardware) parts.push(`HW ${d.hardware}`);
+    if (d.classType) parts.push(d.classType);
+    if (d.powerOn) parts.push("power_on");
+    return parts.join(" · ") || null;
+  };
   for (let r = 1; r < sheet.rows.length; r++) {
     const row = sheet.rows[r];
     if (!row || !row.length) continue;
@@ -214,11 +346,38 @@ async function parseLastReadingByEui(file) {
     if (!eui || IGNORED_EUIS.has(eui)) continue;
     const ts = String(row[tsIdx] || "");
     const decoded = decodePayload(row[payloadIdx]);
-    const isReal = !!(decoded && decoded.pressureBar !== undefined);
-    const entry = lastByEui.get(eui) || { lastAny: "", lastReal: "" };
+    const entry = lastByEui.get(eui) || {
+      lastAny: "",
+      lastReal: "",
+      battery: null,
+      errors: new Set(),
+      gpio1: undefined,
+      gpio2: undefined,
+      deviceInfoRaw: null,
+    };
     if (ts > entry.lastAny) entry.lastAny = ts;
-    if (isReal && ts > entry.lastReal) entry.lastReal = ts;
+    if (decoded) {
+      const isReal = decoded.pressureBar !== undefined || decoded.tempC !== undefined || decoded.condMScm !== undefined;
+      if (isReal && ts > entry.lastReal) entry.lastReal = ts;
+      if (decoded.historical) {
+        for (const h of decoded.historical) {
+          if (h.pressureBar === undefined && h.tempC === undefined && h.condMScm === undefined) continue;
+          const hIso = h.timestamp.toISOString();
+          if (hIso > entry.lastReal) entry.lastReal = hIso;
+        }
+      }
+      if (decoded.battery !== undefined) entry.battery = decoded.battery;
+      decoded.errors.forEach((e) => entry.errors.add(e));
+      if (decoded.gpio1 !== undefined) entry.gpio1 = decoded.gpio1;
+      if (decoded.gpio2 !== undefined) entry.gpio2 = decoded.gpio2;
+      if (decoded.deviceInfo) entry.deviceInfoRaw = { ...entry.deviceInfoRaw, ...decoded.deviceInfo };
+    }
     lastByEui.set(eui, entry);
+  }
+  for (const entry of lastByEui.values()) {
+    entry.errors = Array.from(entry.errors);
+    entry.deviceInfo = deviceInfoSummary(entry.deviceInfoRaw);
+    delete entry.deviceInfoRaw;
   }
   return lastByEui;
 }
@@ -289,6 +448,8 @@ function MuntatgesView() {
   const [sortField, setSortField] = useState(null); // null | "muntatge" | "lectura"
   const [sortDir, setSortDir] = useState("desc"); // "desc" | "asc"
   const [collapsed, setCollapsed] = useState({});
+  const [visibleCols, setVisibleCols] = useState({ battery: true, errors: true, gpio: true, deviceInfo: true });
+  const toggleCol = (key) => setVisibleCols((c) => ({ ...c, [key]: !c[key] }));
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -402,7 +563,16 @@ function MuntatgesView() {
     doc.setTextColor(120);
     doc.text(`Generat el ${new Date().toLocaleString("es-ES")}`, 14, 21);
 
-    const head = [["Pou", "DevEUI", "Illa", "Remesa", "Instal·lador", "Data de muntatge", ...(lastByEui ? ["Última lectura real"] : [])]];
+    const extraCols = lastByEui
+      ? [
+          "Última lectura real",
+          ...(visibleCols.battery ? ["Bateria (%)"] : []),
+          ...(visibleCols.errors ? ["Errors Modbus"] : []),
+          ...(visibleCols.gpio ? ["GPIO 1/2"] : []),
+          ...(visibleCols.deviceInfo ? ["Info dispositiu"] : []),
+        ]
+      : [];
+    const head = [["Pou", "DevEUI", "Illa", "Remesa", "Instal·lador", "Data de muntatge", ...extraCols]];
     const body = [];
     groups.forEach((g) => {
       sortWells(g.wells).forEach((r) => {
@@ -410,6 +580,11 @@ function MuntatgesView() {
         const row = [r.pozo, r.eui ? r.eui.toUpperCase() : "—", getIlla(r.pozo), r.remesa || "—", r.installer || "—", r.date || "pendent"];
         if (lastByEui) {
           row.push(!r.eui ? "—" : activity && activity.lastReal ? activity.lastReal.slice(0, 16).replace("T", " ") : "sense lectures reals");
+          if (visibleCols.battery) row.push(activity && activity.battery !== null && activity.battery !== undefined ? activity.battery : "—");
+          if (visibleCols.errors) row.push(activity && activity.errors && activity.errors.length ? activity.errors.join(", ") : "—");
+          if (visibleCols.gpio)
+            row.push(activity && (activity.gpio1 !== undefined || activity.gpio2 !== undefined) ? `${activity.gpio1 ?? "—"} / ${activity.gpio2 ?? "—"}` : "—");
+          if (visibleCols.deviceInfo) row.push((activity && activity.deviceInfo) || "—");
         }
         body.push(row);
       });
@@ -486,6 +661,26 @@ function MuntatgesView() {
           </button>
         </div>
 
+        {lastByEui && (
+          <div style={styles.segmentGroup}>
+            <span style={styles.segmentLabel}>Columnes:</span>
+            {[
+              ["battery", "Bateria"],
+              ["errors", "Errors Modbus"],
+              ["gpio", "GPIO"],
+              ["deviceInfo", "Info dispositiu"],
+            ].map(([key, label]) => (
+              <button
+                key={key}
+                style={{ ...styles.segmentBtn, ...(visibleCols[key] ? styles.segmentBtnActive : {}) }}
+                onClick={() => toggleCol(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
         {error && (
           <div style={styles.errorBox}>
             <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: 2 }} />
@@ -548,6 +743,10 @@ function MuntatgesView() {
                                   ))}
                               </th>
                             )}
+                            {lastByEui && visibleCols.battery && <th style={styles.th}>Bateria (%)</th>}
+                            {lastByEui && visibleCols.errors && <th style={styles.th}>Errors Modbus</th>}
+                            {lastByEui && visibleCols.gpio && <th style={styles.th}>GPIO 1/2</th>}
+                            {lastByEui && visibleCols.deviceInfo && <th style={styles.th}>Info dispositiu</th>}
                           </tr>
                         </thead>
                         <tbody>
@@ -575,6 +774,32 @@ function MuntatgesView() {
                                       <span style={{ color: "#b03a3a" }}>sense lectures reals</span>
                                     )}
                                   </td>
+                                )}
+                                {lastByEui && visibleCols.battery && (
+                                  <td style={styles.td}>
+                                    {activity && activity.battery !== null && activity.battery !== undefined
+                                      ? activity.battery
+                                      : "—"}
+                                  </td>
+                                )}
+                                {lastByEui && visibleCols.errors && (
+                                  <td style={styles.td}>
+                                    {activity && activity.errors && activity.errors.length ? (
+                                      <span style={{ color: "#b03a3a" }}>{activity.errors.join(", ")}</span>
+                                    ) : (
+                                      "—"
+                                    )}
+                                  </td>
+                                )}
+                                {lastByEui && visibleCols.gpio && (
+                                  <td style={styles.td}>
+                                    {activity && (activity.gpio1 !== undefined || activity.gpio2 !== undefined)
+                                      ? `${activity.gpio1 ?? "—"} / ${activity.gpio2 ?? "—"}`
+                                      : "—"}
+                                  </td>
+                                )}
+                                {lastByEui && visibleCols.deviceInfo && (
+                                  <td style={styles.td}>{(activity && activity.deviceInfo) || "—"}</td>
                                 )}
                               </tr>
                             );
@@ -825,13 +1050,13 @@ function NivellApp() {
           Pozo: g.pozo,
           Fecha: d.date,
           "Lecturas": d.n,
-          "Presión media (bar)": +d.pressureBar.toFixed(4),
-          "Presión media (mH2O)": +d.pressureMH2O.toFixed(4),
+          "Presión media (bar)": d.pressureBar !== null ? +d.pressureBar.toFixed(4) : "",
+          "Presión media (mH2O)": d.pressureMH2O !== null ? +d.pressureMH2O.toFixed(4) : "",
           "Temperatura media (°C)": d.tempC !== null ? +d.tempC.toFixed(2) : "",
           "Conductividad media (mS/cm)": d.condMScm !== null ? +d.condMScm.toFixed(3) : "",
           "Cota (m)": d.cota,
           "Cable fins cota (m)": d.cable,
-          "Nivel freático (m)": +d.nivel.toFixed(3),
+          "Nivel freático (m)": d.nivel !== null ? +d.nivel.toFixed(3) : "",
         });
       });
     });
