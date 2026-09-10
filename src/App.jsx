@@ -157,7 +157,169 @@ function saveAssocToStorage(data) {
   }
 }
 
+async function parseMuntatgesFromWorkbook(assocWb) {
+  const sheet = findSheetWithHeader(assocWb, [/c[oó]digo\s*pozo/i, /data\s*de\s*muntatge/i]);
+  if (!sheet) {
+    throw new Error('No encuentro una hoja con columnas "Código pozo" y "Data de muntatge".');
+  }
+  const headers = sheet.headers;
+  const pozoIdx = findCol(headers, [/c[oó]digo\s*pozo/i, /^codi$/i]);
+  const cotaIdx = findCol(headers, [/^cota$/i]);
+  const installerIdx = findCol(headers, [/instal·?lador/i, /instalador/i]);
+  const dateIdx = findCol(headers, [/data\s*de\s*muntatge/i]);
+  const acabatIdx = findCol(headers, [/^acabat$/i]);
+
+  const rows = [];
+  for (let r = 1; r < sheet.rows.length; r++) {
+    const row = sheet.rows[r];
+    if (!row || !row.length) continue;
+    const pozo = pozoIdx !== -1 ? row[pozoIdx] : null;
+    if (!pozo) continue;
+    rows.push({
+      pozo: String(pozo),
+      cota: cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null,
+      installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
+      date: dateIdx !== -1 ? String(row[dateIdx] || "").trim() : "",
+      acabat: acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "",
+    });
+  }
+  return rows;
+}
+
+function parseMuntatgeDate(s) {
+  // Formats vistos: "31/07/2026" o "25/08/2026 7:51:00"
+  const m = String(s || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return null;
+  return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+}
+
+function MuntatgesView() {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const wb = await fetchWorkbookFromUrl(ASSOC_CSV_URL);
+      const data = await parseMuntatgesFromWorkbook(wb);
+      setRows(data);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const filtered = useMemo(() => {
+    if (!rows) return [];
+    const q = query.trim().toLowerCase();
+    const list = q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
+    return [...list].sort((a, b) => {
+      const da = parseMuntatgeDate(a.date);
+      const db = parseMuntatgeDate(b.date);
+      if (da && db) return db - da; // més recent primer
+      if (da) return -1;
+      if (db) return 1;
+      return a.pozo.localeCompare(b.pozo);
+    });
+  }, [rows, query]);
+
+  const muntats = filtered.filter((r) => parseMuntatgeDate(r.date));
+  const pendents = filtered.filter((r) => !parseMuntatgeDate(r.date));
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.headerBar}>
+        <div style={styles.brand}>
+          <Waves size={22} color="#e8f3f2" />
+          <span style={styles.brandText}>Muntatges</span>
+        </div>
+        <span style={styles.brandSub}>Data de muntatge i instal·lador per pou</span>
+      </div>
+
+      <div style={styles.container}>
+        <div style={styles.searchRow}>
+          <div style={styles.searchBar}>
+            <Search size={16} color="#7c9490" />
+            <input
+              style={styles.searchInput}
+              placeholder="Filtrar per codi de pou…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+          <button style={styles.secondaryBtn} onClick={load} disabled={loading}>
+            <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            {loading ? "Actualitzant…" : "Actualitzar ara"}
+          </button>
+        </div>
+
+        {error && (
+          <div style={styles.errorBox}>
+            <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: 2 }} />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {rows && (
+          <>
+            <div style={styles.statsRow}>
+              <Stat label="Pous muntats" value={muntats.length} />
+              <Stat label="Pendents de muntar" value={pendents.length} />
+              <Stat label="Total pous al full" value={rows.length} />
+            </div>
+
+            <div style={{ ...styles.groupCard, marginTop: 22 }}>
+              <div style={styles.tableWrap}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      <th style={styles.th}>Pou</th>
+                      <th style={styles.th}>Cota</th>
+                      <th style={styles.th}>Instal·lador</th>
+                      <th style={styles.th}>Data de muntatge</th>
+                      <th style={styles.th}>Acabat</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((r, i) => (
+                      <tr key={i}>
+                        <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                        <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
+                        <td style={styles.td}>{r.installer || "—"}</td>
+                        <td style={styles.td}>{r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}</td>
+                        <td style={styles.td}>{r.acabat || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      <footer style={styles.footer}>
+        © {new Date().getFullYear()} Instal·lacions JFA. Tots els drets reservats.
+      </footer>
+    </div>
+  );
+}
+
 export default function App() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("vista") === "muntatges") return <MuntatgesView />;
+  return <NivellApp />;
+}
+
+function NivellApp() {
   const [assocData, setAssocData] = useState(null); // { map, excluded, fileName, savedAt, source }
   const [assocLoading, setAssocLoading] = useState(true);
   const [assocError, setAssocError] = useState(null);
