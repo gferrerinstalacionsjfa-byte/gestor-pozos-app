@@ -255,6 +255,15 @@ function parseMuntatgeDate(s) {
   return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
 }
 
+function getIlla(pozoCode) {
+  const p = String(pozoCode || "").toUpperCase();
+  if (p.startsWith("MA")) return "Mallorca";
+  if (p.startsWith("ME")) return "Menorca";
+  if (p.startsWith("EI")) return "Eivissa";
+  if (p.startsWith("FO")) return "Formentera";
+  return "Altres";
+}
+
 function MuntatgesView() {
   const [rows, setRows] = useState(null);
   const [error, setError] = useState(null);
@@ -264,7 +273,9 @@ function MuntatgesView() {
   const [lastByEui, setLastByEui] = useState(null);
   const [readingsError, setReadingsError] = useState(null);
   const [readingsLoading, setReadingsLoading] = useState(false);
-  const [groupSortDir, setGroupSortDir] = useState({}); // installer -> "desc" | "asc"
+  const [groupBy, setGroupBy] = useState("installer"); // "installer" | "illa" | "none"
+  const [sortField, setSortField] = useState("muntatge"); // "muntatge" | "lectura"
+  const [sortDir, setSortDir] = useState("desc"); // "desc" | "asc"
   const [collapsed, setCollapsed] = useState({});
 
   const load = useCallback(async () => {
@@ -300,36 +311,58 @@ function MuntatgesView() {
     }
   }, []);
 
-  const sortWells = (wells, dir) =>
-    [...wells].sort((a, b) => {
-      const da = parseMuntatgeDate(a.date);
-      const db = parseMuntatgeDate(b.date);
-      if (da && db) return dir === "desc" ? db - da : da - db;
-      if (da) return -1;
-      if (db) return 1;
-      return a.pozo.localeCompare(b.pozo);
-    });
+  // si es tria ordenar per última lectura però encara no hi ha fitxer carregat, es torna a "muntatge"
+  useEffect(() => {
+    if (sortField === "lectura" && !lastByEui) setSortField("muntatge");
+  }, [lastByEui, sortField]);
 
-  const toggleGroupSort = (installer) =>
-    setGroupSortDir((d) => ({ ...d, [installer]: (d[installer] || "desc") === "desc" ? "asc" : "desc" }));
+  const sortValue = useCallback(
+    (r) => {
+      if (sortField === "lectura") {
+        const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+        return activity && activity.lastReal ? new Date(activity.lastReal) : null;
+      }
+      return parseMuntatgeDate(r.date);
+    },
+    [sortField, lastByEui]
+  );
 
-  const groups = useMemo(() => {
+  const sortWells = useCallback(
+    (wells) =>
+      [...wells].sort((a, b) => {
+        const va = sortValue(a);
+        const vb = sortValue(b);
+        if (va && vb) return sortDir === "desc" ? vb - va : va - vb;
+        if (va) return -1;
+        if (vb) return 1;
+        return a.pozo.localeCompare(b.pozo);
+      }),
+    [sortValue, sortDir]
+  );
+
+  const filteredRows = useMemo(() => {
     if (!rows) return [];
     const q = query.trim().toLowerCase();
-    const list = q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
-    const byInstaller = new Map();
-    for (const r of list) {
-      const key = r.installer || "Sense instal·lador assignat";
-      if (!byInstaller.has(key)) byInstaller.set(key, []);
-      byInstaller.get(key).push(r);
-    }
-    return Array.from(byInstaller.entries())
-      .map(([installer, wells]) => ({ installer, wells }))
-      .sort((a, b) => a.installer.localeCompare(b.installer));
+    return q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
   }, [rows, query]);
 
+  const groups = useMemo(() => {
+    if (groupBy === "none") {
+      return [{ key: "__all__", label: "Tots els pous", wells: filteredRows }];
+    }
+    const byKey = new Map();
+    for (const r of filteredRows) {
+      const key = groupBy === "illa" ? getIlla(r.pozo) : r.installer || "Sense instal·lador assignat";
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(r);
+    }
+    return Array.from(byKey.entries())
+      .map(([key, wells]) => ({ key, label: key, wells }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [filteredRows, groupBy]);
+
   const pendents = useMemo(() => (rows || []).filter((r) => !parseMuntatgeDate(r.date)), [rows]);
-  const toggle = (installer) => setCollapsed((c) => ({ ...c, [installer]: !c[installer] }));
+  const toggle = (key) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
 
   const exportPdf = () => {
     const doc = new jsPDF();
@@ -339,13 +372,12 @@ function MuntatgesView() {
     doc.setTextColor(120);
     doc.text(`Generat el ${new Date().toLocaleString("es-ES")}`, 14, 21);
 
-    const head = [["Pou", "Remesa", "Instal·lador", "Data de muntatge", ...(lastByEui ? ["Última lectura real"] : [])]];
+    const head = [["Pou", "Illa", "Remesa", "Instal·lador", "Data de muntatge", ...(lastByEui ? ["Última lectura real"] : [])]];
     const body = [];
     groups.forEach((g) => {
-      const dir = groupSortDir[g.installer] || "desc";
-      sortWells(g.wells, dir).forEach((r) => {
+      sortWells(g.wells).forEach((r) => {
         const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
-        const row = [r.pozo, r.remesa || "—", g.installer, r.date || "pendent"];
+        const row = [r.pozo, getIlla(r.pozo), r.remesa || "—", r.installer || "—", r.date || "pendent"];
         if (lastByEui) {
           row.push(!r.eui ? "—" : activity && activity.lastReal ? activity.lastReal.slice(0, 16).replace("T", " ") : "sense lectures reals");
         }
@@ -385,6 +417,50 @@ function MuntatgesView() {
           }
         />
 
+        <div style={styles.controlsRow}>
+          <div style={styles.segmentGroup}>
+            <span style={styles.segmentLabel}>Agrupar per:</span>
+            {[
+              ["installer", "Instal·lador"],
+              ["illa", "Illa"],
+              ["none", "Tot junt"],
+            ].map(([val, label]) => (
+              <button
+                key={val}
+                style={{ ...styles.segmentBtn, ...(groupBy === val ? styles.segmentBtnActive : {}) }}
+                onClick={() => setGroupBy(val)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div style={styles.segmentGroup}>
+            <span style={styles.segmentLabel}>Ordenar per:</span>
+            <button
+              style={{ ...styles.segmentBtn, ...(sortField === "muntatge" ? styles.segmentBtnActive : {}) }}
+              onClick={() => setSortField("muntatge")}
+            >
+              Data de muntatge
+            </button>
+            <button
+              style={{
+                ...styles.segmentBtn,
+                ...(sortField === "lectura" ? styles.segmentBtnActive : {}),
+                ...(!lastByEui ? styles.segmentBtnDisabled : {}),
+              }}
+              onClick={() => lastByEui && setSortField("lectura")}
+              disabled={!lastByEui}
+              title={!lastByEui ? "Puja un fitxer de lectures per activar aquest ordre" : ""}
+            >
+              Última lectura real
+            </button>
+            <button style={styles.segmentBtn} onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}>
+              {sortDir === "desc" ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
+            </button>
+          </div>
+        </div>
+
         <div style={styles.searchRow}>
           <div style={styles.searchBar}>
             <Search size={16} color="#7c9490" />
@@ -417,46 +493,42 @@ function MuntatgesView() {
             <div style={styles.statsRow}>
               <Stat label="Pous amb cable vàlid" value={rows.length} />
               <Stat label="Pendents de muntar" value={pendents.length} warn />
-              <Stat label="Instal·ladors" value={groups.length} />
+              {groupBy !== "none" && <Stat label={groupBy === "illa" ? "Illes" : "Instal·ladors"} value={groups.length} />}
             </div>
 
             <div style={styles.groupsWrap}>
               {groups.map((g) => (
-                <div key={g.installer} style={styles.groupCard}>
-                  <button style={styles.groupHeader} onClick={() => toggle(g.installer)}>
-                    {collapsed[g.installer] ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
-                    <CheckCircle2 size={16} color="#3e8e86" style={{ marginRight: 6 }} />
-                    <span style={styles.groupTitle}>{g.installer}</span>
-                    <span style={styles.groupMeta}>{g.wells.length} pous</span>
-                  </button>
-                  {!collapsed[g.installer] && (
+                <div key={g.key} style={styles.groupCard}>
+                  {groupBy !== "none" && (
+                    <button style={styles.groupHeader} onClick={() => toggle(g.key)}>
+                      {collapsed[g.key] ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+                      <CheckCircle2 size={16} color="#3e8e86" style={{ marginRight: 6 }} />
+                      <span style={styles.groupTitle}>{g.label}</span>
+                      <span style={styles.groupMeta}>{g.wells.length} pous</span>
+                    </button>
+                  )}
+                  {(groupBy === "none" || !collapsed[g.key]) && (
                     <div style={styles.tableWrap}>
                       <table style={styles.table}>
                         <thead>
                           <tr>
                             <th style={styles.th}>Pou</th>
+                            {groupBy !== "illa" && <th style={styles.th}>Illa</th>}
                             <th style={styles.th}>Remesa</th>
-                            <th
-                              style={{ ...styles.th, cursor: "pointer", userSelect: "none" }}
-                              onClick={() => toggleGroupSort(g.installer)}
-                            >
-                              Data de muntatge
-                              {(groupSortDir[g.installer] || "desc") === "desc" ? (
-                                <ChevronDown size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
-                              ) : (
-                                <ChevronUp size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
-                              )}
-                            </th>
+                            {groupBy !== "installer" && <th style={styles.th}>Instal·lador</th>}
+                            <th style={styles.th}>Data de muntatge</th>
                             {lastByEui && <th style={styles.th}>Última lectura real</th>}
                           </tr>
                         </thead>
                         <tbody>
-                          {sortWells(g.wells, groupSortDir[g.installer] || "desc").map((r, i) => {
+                          {sortWells(g.wells).map((r, i) => {
                             const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
                             return (
                               <tr key={i}>
                                 <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                                {groupBy !== "illa" && <td style={styles.td}>{getIlla(r.pozo)}</td>}
                                 <td style={styles.td}>{r.remesa || "—"}</td>
+                                {groupBy !== "installer" && <td style={styles.td}>{r.installer || "—"}</td>}
                                 <td style={styles.td}>
                                   {r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}
                                 </td>
@@ -494,6 +566,7 @@ function MuntatgesView() {
 
 export default function App() {
   const params = new URLSearchParams(window.location.search);
+
   if (params.get("vista") === "muntatges") return <MuntatgesView />;
   return <NivellApp />;
 }
@@ -1228,6 +1301,20 @@ const styles = {
     flex: "1 1 260px",
   },
   searchRow: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginTop: 22 },
+  controlsRow: { display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap", marginTop: 22 },
+  segmentGroup: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },
+  segmentLabel: { fontSize: 12.5, color: "#7c9490", marginRight: 2 },
+  segmentBtn: {
+    background: "#fff",
+    border: "1px solid #e1ecea",
+    borderRadius: 7,
+    padding: "6px 12px",
+    fontSize: 12.5,
+    color: "#4a615d",
+    cursor: "pointer",
+  },
+  segmentBtnActive: { background: "#1f5e59", borderColor: "#1f5e59", color: "#fff", fontWeight: 600 },
+  segmentBtnDisabled: { opacity: 0.4, cursor: "not-allowed" },
   searchInput: { border: "none", outline: "none", fontSize: 13.5, flex: 1, background: "transparent" },
   groupsWrap: { marginTop: 16, display: "flex", flexDirection: "column", gap: 10 },
   emptyMsg: { color: "#7c9490", fontSize: 13.5, padding: "20px 0" },
