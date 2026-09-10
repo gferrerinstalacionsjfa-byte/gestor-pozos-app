@@ -1,6 +1,8 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
-import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, ChevronUp, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
 
 const BAR_TO_MH2O = 10.19716;
 const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
@@ -31,28 +33,150 @@ function findCol(headers, patterns) {
 
 function decodePayload(hex) {
   if (!hex || typeof hex !== "string") return null;
-  const clean = hex.replace(/\s/g, "");
-  if (!/^[0-9a-fA-F]+$/.test(clean) || clean.length < 16) return null;
+  const clean = hex.replace(/\s/g, "").toUpperCase();
+  if (!/^[0-9A-F]+$/.test(clean) || clean.length < 4) return null;
   const bytes = [];
   for (let i = 0; i < clean.length; i += 2) bytes.push(parseInt(clean.substr(i, 2), 16));
+  const len = bytes.length;
 
-  const out = {};
-  for (let i = 0; i + 8 <= bytes.length; i++) {
-    if (bytes[i] === 0xff && bytes[i + 1] === 0x0e) {
+  const readFloat32LE = (offset) => {
+    if (offset + 4 > len) return null;
+    const buf = new ArrayBuffer(4);
+    const view = new DataView(buf);
+    for (let k = 0; k < 4; k++) view.setUint8(k, bytes[offset + k]);
+    const val = view.getFloat32(0, true);
+    return Number.isFinite(val) ? val : null;
+  };
+  const readUint32LE = (offset) => {
+    if (offset + 4 > len) return null;
+    return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+  };
+  const readUint16LE = (offset) => {
+    if (offset + 2 > len) return null;
+    return bytes[offset] | (bytes[offset + 1] << 8);
+  };
+
+  const out = { errors: [], deviceInfo: null, ack: null, historical: [] };
+
+  // --- Comandos / ACK (comença per FE) ---
+  if (bytes[0] === 0xfe) {
+    const code = bytes[1];
+    if (code === 0x02) out.ack = `ACK collecting interval: ${readUint16LE(2)} s`;
+    else if (code === 0x03) out.ack = `ACK reporting interval: ${readUint16LE(2)} s`;
+    else if (code === 0x68) out.ack = `ACK Data Storage: ${bytes[2] === 0x01 ? "activat" : "desactivat"}`;
+    else if (code === 0x69) out.ack = `ACK Data Retransmission: ${bytes[2] === 0x01 ? "activada" : "desactivada"}`;
+    else if (code === 0x6a) out.ack = "ACK comando FF6A";
+    else if (code === 0x10) out.ack = "ACK reinici UC502";
+    else if (code === 0x28) out.ack = "ACK petició de dada actual";
+    else out.ack = `Resposta/ACK UC502: ${clean}`;
+  }
+
+  // --- GPIO ---
+  if (bytes[0] === 0x03 && bytes[1] === 0x00) out.gpio1 = bytes[2];
+  if (bytes[3] === 0x04 && bytes[4] === 0x00) out.gpio2 = bytes[5];
+
+  // --- Bateria (últims 3 bytes: 01 75 XX) ---
+  if (len >= 3 && bytes[len - 3] === 0x01 && bytes[len - 2] === 0x75) {
+    out.battery = bytes[len - 1];
+  }
+
+  // --- Errors RS485/Modbus i lectures en viu (FF0E = dada, FF15 = error) ---
+  for (let i = 0; i + 3 <= len; i++) {
+    if (bytes[i] === 0xff && (bytes[i + 1] === 0x0e || bytes[i + 1] === 0x15)) {
       const channel = bytes[i + 2];
-      const buf = new ArrayBuffer(4);
-      const view = new DataView(buf);
-      for (let k = 0; k < 4; k++) view.setUint8(k, bytes[i + 4 + k]);
-      const val = view.getFloat32(0, true); // little-endian
-      if (Number.isFinite(val)) {
-        if (channel === 7) out.pressureBar = val;
-        else if (channel === 8) out.tempC = val;
-        else if (channel === 9) out.condMScm = val;
+      if (bytes[i + 1] === 0x15) {
+        if (channel === 7) out.errors.push("presió");
+        else if (channel === 8) out.errors.push("temperatura");
+        else if (channel === 9) out.errors.push("conductivitat");
+        i += 2;
+        continue;
       }
-      i += 7; // skip consumed bytes (loop will +1 more)
+      if (bytes[i + 3] === 0x25) {
+        const val = readFloat32LE(i + 4);
+        if (val !== null) {
+          if (channel === 7) out.pressureBar = val;
+          else if (channel === 8) out.tempC = val;
+          else if (channel === 9) out.condMScm = val;
+        }
+        i += 7;
+      }
     }
   }
-  return Object.keys(out).length ? out : null;
+
+  // --- Informació del dispositiu ---
+  for (let i = 0; i + 2 <= len; i++) {
+    if (bytes[i] !== 0xff) continue;
+    const code = bytes[i + 1];
+    if (code === 0x0b) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.powerOn = true;
+    } else if (code === 0x16 && i + 10 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.serial = bytes
+        .slice(i + 2, i + 10)
+        .map((b) => b.toString(16).padStart(2, "0").toUpperCase())
+        .join("");
+    } else if (code === 0x09 && i + 4 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.firmware = `${bytes[i + 2]}.${bytes[i + 3]}`;
+    } else if (code === 0x0a && i + 4 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.hardware = `${String(bytes[i + 2]).padStart(2, "0")}.${String(bytes[i + 3]).padStart(2, "0")}`;
+    } else if (code === 0x0f && i + 3 <= len) {
+      out.deviceInfo = out.deviceInfo || {};
+      out.deviceInfo.classType = bytes[i + 2] === 0x00 ? "Class A" : "Desconeguda";
+    }
+  }
+
+  // --- Històrics 20DC / 20DD ---
+  for (let i = 0; i + 2 <= len; i++) {
+    if (bytes[i] === 0x20 && bytes[i + 1] === 0xdc) {
+      const ts = readUint32LE(i + 2);
+      if (ts !== null) out.historical.push({ timestamp: new Date(ts * 1000), type: "20DC" });
+    } else if (bytes[i] === 0x20 && bytes[i + 1] === 0xdd) {
+      const ts = readUint32LE(i + 2);
+      const mask = readUint16LE(i + 6);
+      if (ts === null || mask === null) continue;
+      const rec = { timestamp: new Date(ts * 1000), type: "20DD" };
+      let offset = i + 8;
+      if (mask & 1) {
+        if (bytes[offset] === 0x25) {
+          const v = readFloat32LE(offset + 1);
+          if (v !== null) rec.pressureBar = v;
+        }
+        offset += 5;
+      }
+      if (mask & 2) {
+        if (bytes[offset] === 0x25) {
+          const v = readFloat32LE(offset + 1);
+          if (v !== null) rec.tempC = v;
+        }
+        offset += 5;
+      }
+      if (mask & 4) {
+        if (bytes[offset] === 0x25) {
+          const v = readFloat32LE(offset + 1);
+          if (v !== null) rec.condMScm = v;
+        }
+        offset += 5;
+      }
+      out.historical.push(rec);
+    }
+  }
+
+  const hasAnything =
+    out.pressureBar !== undefined ||
+    out.tempC !== undefined ||
+    out.condMScm !== undefined ||
+    out.battery !== undefined ||
+    out.gpio1 !== undefined ||
+    out.gpio2 !== undefined ||
+    out.errors.length ||
+    out.deviceInfo ||
+    out.ack ||
+    out.historical.length;
+
+  return hasAnything ? out : null;
 }
 
 function findSheetWithHeader(workbook, patterns) {
@@ -164,10 +288,13 @@ async function parseMuntatgesFromWorkbook(assocWb) {
   }
   const headers = sheet.headers;
   const pozoIdx = findCol(headers, [/c[oó]digo\s*pozo/i, /^codi$/i]);
+  const euiIdx = findCol(headers, [/dev\s*eui/i]);
   const cotaIdx = findCol(headers, [/^cota$/i]);
+  const cableIdx = findCol(headers, [/cable\s*fins\s*cota/i]);
   const installerIdx = findCol(headers, [/instal·?lador/i, /instalador/i]);
   const dateIdx = findCol(headers, [/data\s*de\s*muntatge/i]);
   const acabatIdx = findCol(headers, [/^acabat$/i]);
+  const remesaIdx = findCol(headers, [/^remesa$/i]);
 
   const rows = [];
   for (let r = 1; r < sheet.rows.length; r++) {
@@ -175,15 +302,93 @@ async function parseMuntatgesFromWorkbook(assocWb) {
     if (!row || !row.length) continue;
     const pozo = pozoIdx !== -1 ? row[pozoIdx] : null;
     if (!pozo) continue;
+    const cable = cableIdx !== -1 ? parseCableFinsCota(row[cableIdx]) : null;
+    if (cable === null) continue; // solo pozos con medida de cable válida
     rows.push({
       pozo: String(pozo),
+      eui: euiIdx !== -1 ? normEUI(row[euiIdx]) : "",
       cota: cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null,
+      cable,
       installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
-      date: dateIdx !== -1 ? String(row[dateIdx] || "").trim() : "",
+      date: dateIdx !== -1 ? normalizeMuntatgeDateString(row[dateIdx]) : "",
       acabat: acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "",
+      remesa: remesaIdx !== -1 ? String(row[remesaIdx] || "").trim() : "",
     });
   }
   return rows;
+}
+
+async function parseLastReadingByEui(file) {
+  const wb = await readWorkbook(file);
+  const sheet = findSheetWithHeader(wb, [/dev\s*eui/i, /payload/i]);
+  if (!sheet) {
+    throw new Error('No encuentro columnas "DevEUI" y "Payload" en este archivo de lecturas.');
+  }
+  const euiIdx = findCol(sheet.headers, [/dev\s*eui/i]);
+  const tsIdx = findCol(sheet.headers, [/marca\s*de\s*temps/i, /timestamp/i]);
+  const payloadIdx = findCol(sheet.headers, [/payload/i]);
+
+  const lastByEui = new Map(); // eui -> { lastAny, lastReal }
+  for (let r = 1; r < sheet.rows.length; r++) {
+    const row = sheet.rows[r];
+    if (!row || !row.length) continue;
+    const eui = normEUI(row[euiIdx]);
+    if (!eui || IGNORED_EUIS.has(eui)) continue;
+    const ts = String(row[tsIdx] || "");
+    const decoded = decodePayload(row[payloadIdx]);
+    const entry = lastByEui.get(eui) || { lastAny: "", lastReal: "" };
+    if (ts > entry.lastAny) entry.lastAny = ts;
+    if (decoded) {
+      const isReal = decoded.pressureBar !== undefined || decoded.tempC !== undefined || decoded.condMScm !== undefined;
+      if (isReal && ts > entry.lastReal) entry.lastReal = ts;
+      if (decoded.historical) {
+        for (const h of decoded.historical) {
+          if (h.pressureBar === undefined && h.tempC === undefined && h.condMScm === undefined) continue;
+          const hIso = h.timestamp.toISOString();
+          if (hIso > entry.lastReal) entry.lastReal = hIso;
+        }
+      }
+    }
+    lastByEui.set(eui, entry);
+  }
+  return lastByEui;
+}
+
+function excelSerialToDate(serial) {
+  const base = Date.UTC(1899, 11, 30);
+  return new Date(base + serial * 86400000);
+}
+
+function formatMuntatgeDate(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const datePart = `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}/${d.getUTCFullYear()}`;
+  const hasTime = d.getUTCHours() || d.getUTCMinutes() || d.getUTCSeconds();
+  if (!hasTime) return datePart;
+  return `${datePart} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function normalizeMuntatgeDateString(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(.*)$/);
+  if (m) {
+    let day = Number(m[1]);
+    let month = Number(m[2]);
+    const rest = m[4] || "";
+    // si el "mes" no pot ser-ho (>12) però el "dia" sí, és que ve escrit mes/dia -> es capgira
+    if (month > 12 && day <= 12) {
+      [day, month] = [month, day];
+    }
+    // si els dos números són <=12 és ambigu: es manté l'ordre tal com ve (dia/mes, conveni majoritari al full)
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(day)}/${pad(month)}/${m[3]}${rest}`;
+  }
+  // número de sèrie de data del full de càlcul (dies des del 30/12/1899), a vegades amb decimals d'hora
+  const num = Number(s);
+  if (!Number.isNaN(num) && num > 1000 && num < 100000) {
+    return formatMuntatgeDate(excelSerialToDate(num));
+  }
+  return s; // valor no reconegut: es deixa tal qual, no es descarta
 }
 
 function parseMuntatgeDate(s) {
@@ -193,11 +398,28 @@ function parseMuntatgeDate(s) {
   return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
 }
 
+function getIlla(pozoCode) {
+  const p = String(pozoCode || "").toUpperCase();
+  if (p.startsWith("MA")) return "Mallorca";
+  if (p.startsWith("ME")) return "Menorca";
+  if (p.startsWith("EI")) return "Eivissa";
+  if (p.startsWith("FO")) return "Formentera";
+  return "Altres";
+}
+
 function MuntatgesView() {
   const [rows, setRows] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
+  const [readingsFile, setReadingsFile] = useState(null);
+  const [lastByEui, setLastByEui] = useState(null);
+  const [readingsError, setReadingsError] = useState(null);
+  const [readingsLoading, setReadingsLoading] = useState(false);
+  const [groupBy, setGroupBy] = useState("installer"); // "installer" | "illa" | "none"
+  const [sortField, setSortField] = useState(null); // null | "muntatge" | "lectura"
+  const [sortDir, setSortDir] = useState("desc"); // "desc" | "asc"
+  const [collapsed, setCollapsed] = useState({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -217,22 +439,116 @@ function MuntatgesView() {
     load();
   }, [load]);
 
-  const filtered = useMemo(() => {
+  const handleReadingsFile = useCallback(async (file) => {
+    setReadingsFile(file);
+    setReadingsLoading(true);
+    setReadingsError(null);
+    setLastByEui(null);
+    try {
+      const map = await parseLastReadingByEui(file);
+      setLastByEui(map);
+    } catch (e) {
+      setReadingsError(e.message || String(e));
+    } finally {
+      setReadingsLoading(false);
+    }
+  }, []);
+
+  // si es queda sense fitxer de lectures mentre s'ordenava per última lectura, es treu l'ordre
+  useEffect(() => {
+    if (sortField === "lectura" && !lastByEui) setSortField(null);
+  }, [lastByEui, sortField]);
+
+  // clic a una capçalera ordenable: 1r clic -> desc (▾), 2n clic -> asc (▴), 3r clic -> treu l'ordre
+  const toggleSort = (field) => {
+    setSortField((current) => {
+      if (current !== field) {
+        setSortDir("desc");
+        return field;
+      }
+      if (sortDir === "desc") {
+        setSortDir("asc");
+        return field;
+      }
+      return null; // 3r clic: treu el filtre d'ordre
+    });
+  };
+
+  const sortValue = useCallback(
+    (r) => {
+      if (sortField === "lectura") {
+        const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+        return activity && activity.lastReal ? new Date(activity.lastReal) : null;
+      }
+      if (sortField === "muntatge") return parseMuntatgeDate(r.date);
+      return null;
+    },
+    [sortField, lastByEui]
+  );
+
+  const sortWells = useCallback(
+    (wells) => {
+      if (!sortField) return [...wells].sort((a, b) => a.pozo.localeCompare(b.pozo));
+      return [...wells].sort((a, b) => {
+        const va = sortValue(a);
+        const vb = sortValue(b);
+        if (va && vb) return sortDir === "desc" ? vb - va : va - vb;
+        if (va) return -1;
+        if (vb) return 1;
+        return a.pozo.localeCompare(b.pozo);
+      });
+    },
+    [sortValue, sortDir, sortField]
+  );
+
+  const filteredRows = useMemo(() => {
     if (!rows) return [];
     const q = query.trim().toLowerCase();
-    const list = q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
-    return [...list].sort((a, b) => {
-      const da = parseMuntatgeDate(a.date);
-      const db = parseMuntatgeDate(b.date);
-      if (da && db) return db - da; // més recent primer
-      if (da) return -1;
-      if (db) return 1;
-      return a.pozo.localeCompare(b.pozo);
-    });
+    return q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
   }, [rows, query]);
 
-  const muntats = filtered.filter((r) => parseMuntatgeDate(r.date));
-  const pendents = filtered.filter((r) => !parseMuntatgeDate(r.date));
+  const groups = useMemo(() => {
+    if (groupBy === "none") {
+      return [{ key: "__all__", label: "Tots els pous", wells: filteredRows }];
+    }
+    const byKey = new Map();
+    for (const r of filteredRows) {
+      const key = groupBy === "illa" ? getIlla(r.pozo) : r.installer || "Sense instal·lador assignat";
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(r);
+    }
+    return Array.from(byKey.entries())
+      .map(([key, wells]) => ({ key, label: key, wells }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [filteredRows, groupBy]);
+
+  const pendents = useMemo(() => (rows || []).filter((r) => !parseMuntatgeDate(r.date)), [rows]);
+  const toggle = (key) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
+
+  const exportPdf = () => {
+    const doc = new jsPDF();
+    doc.setFontSize(14);
+    doc.text("Muntatges — Instal·lacions JFA", 14, 15);
+    doc.setFontSize(9);
+    doc.setTextColor(120);
+    doc.text(`Generat el ${new Date().toLocaleString("es-ES")}`, 14, 21);
+
+    const head = [["Pou", "DevEUI", "Illa", "Remesa", "Instal·lador", "Data de muntatge", ...(lastByEui ? ["Última lectura real"] : [])]];
+    const body = [];
+    groups.forEach((g) => {
+      sortWells(g.wells).forEach((r) => {
+        const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+        const row = [r.pozo, r.eui ? r.eui.toUpperCase() : "—", getIlla(r.pozo), r.remesa || "—", r.installer || "—", r.date || "pendent"];
+        if (lastByEui) {
+          row.push(!r.eui ? "—" : activity && activity.lastReal ? activity.lastReal.slice(0, 16).replace("T", " ") : "sense lectures reals");
+        }
+        body.push(row);
+      });
+    });
+
+    autoTable(doc, { head, body, startY: 26, styles: { fontSize: 8 }, headStyles: { fillColor: [31, 94, 89] } });
+    doc.save(`muntatges_${new Date().toISOString().slice(0, 10)}.pdf`);
+  };
 
   return (
     <div style={styles.page}>
@@ -241,10 +557,46 @@ function MuntatgesView() {
           <Waves size={22} color="#e8f3f2" />
           <span style={styles.brandText}>Muntatges</span>
         </div>
-        <span style={styles.brandSub}>Data de muntatge i instal·lador per pou</span>
+        <span style={styles.brandSub}>Data de muntatge i instal·lador, pous amb cable fins cota mesurat</span>
       </div>
 
       <div style={styles.container}>
+        <UploadCard
+          label="Fitxer de lectures (opcional)"
+          hint="Puja l'export de lectures per veure l'última comunicació real de cada pou — arrossega'l aquí o fes clic"
+          file={readingsFile}
+          onFile={handleReadingsFile}
+          inputId="muntatges-readings-input"
+          extra={
+            readingsError ? (
+              <span style={{ color: "#a86a2d" }}>{readingsError}</span>
+            ) : readingsLoading ? (
+              <span>Analitzant…</span>
+            ) : lastByEui ? (
+              <span style={{ color: "#2a8f6c", fontWeight: 600 }}>{lastByEui.size} DevEUI amb activitat al fitxer</span>
+            ) : null
+          }
+        />
+
+        <div style={styles.controlsRow}>
+          <div style={styles.segmentGroup}>
+            <span style={styles.segmentLabel}>Agrupar per:</span>
+            {[
+              ["installer", "Instal·lador"],
+              ["illa", "Illa"],
+              ["none", "Tot junt"],
+            ].map(([val, label]) => (
+              <button
+                key={val}
+                style={{ ...styles.segmentBtn, ...(groupBy === val ? styles.segmentBtnActive : {}) }}
+                onClick={() => setGroupBy(val)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div style={styles.searchRow}>
           <div style={styles.searchBar}>
             <Search size={16} color="#7c9490" />
@@ -255,6 +607,10 @@ function MuntatgesView() {
               onChange={(e) => setQuery(e.target.value)}
             />
           </div>
+          <button style={styles.secondaryBtn} onClick={exportPdf} disabled={!rows || !rows.length}>
+            <Download size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            Descarregar PDF
+          </button>
           <button style={styles.secondaryBtn} onClick={load} disabled={loading}>
             <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
             {loading ? "Actualitzant…" : "Actualitzar ara"}
@@ -271,36 +627,95 @@ function MuntatgesView() {
         {rows && (
           <>
             <div style={styles.statsRow}>
-              <Stat label="Pous muntats" value={muntats.length} />
-              <Stat label="Pendents de muntar" value={pendents.length} />
-              <Stat label="Total pous al full" value={rows.length} />
+              <Stat label="Pous amb cable vàlid" value={rows.length} />
+              <Stat label="Pendents de muntar" value={pendents.length} warn />
+              {groupBy !== "none" && <Stat label={groupBy === "illa" ? "Illes" : "Instal·ladors"} value={groups.length} />}
             </div>
 
-            <div style={{ ...styles.groupCard, marginTop: 22 }}>
-              <div style={styles.tableWrap}>
-                <table style={styles.table}>
-                  <thead>
-                    <tr>
-                      <th style={styles.th}>Pou</th>
-                      <th style={styles.th}>Cota</th>
-                      <th style={styles.th}>Instal·lador</th>
-                      <th style={styles.th}>Data de muntatge</th>
-                      <th style={styles.th}>Acabat</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filtered.map((r, i) => (
-                      <tr key={i}>
-                        <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
-                        <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
-                        <td style={styles.td}>{r.installer || "—"}</td>
-                        <td style={styles.td}>{r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}</td>
-                        <td style={styles.td}>{r.acabat || "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+            <div style={styles.groupsWrap}>
+              {groups.map((g) => (
+                <div key={g.key} style={styles.groupCard}>
+                  {groupBy !== "none" && (
+                    <button style={styles.groupHeader} onClick={() => toggle(g.key)}>
+                      {collapsed[g.key] ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+                      <CheckCircle2 size={16} color="#3e8e86" style={{ marginRight: 6 }} />
+                      <span style={styles.groupTitle}>{g.label}</span>
+                      <span style={styles.groupMeta}>{g.wells.length} pous</span>
+                    </button>
+                  )}
+                  {(groupBy === "none" || !collapsed[g.key]) && (
+                    <div style={styles.tableWrap}>
+                      <table style={styles.table}>
+                        <thead>
+                          <tr>
+                            <th style={styles.th}>Pou</th>
+                            <th style={styles.th}>DevEUI</th>
+                            {groupBy !== "illa" && <th style={styles.th}>Illa</th>}
+                            <th style={styles.th}>Remesa</th>
+                            {groupBy !== "installer" && <th style={styles.th}>Instal·lador</th>}
+                            <th
+                              style={{ ...styles.th, cursor: "pointer", userSelect: "none" }}
+                              onClick={() => toggleSort("muntatge")}
+                            >
+                              Data de muntatge
+                              {sortField === "muntatge" &&
+                                (sortDir === "desc" ? (
+                                  <ChevronDown size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                ) : (
+                                  <ChevronUp size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                ))}
+                            </th>
+                            {lastByEui && (
+                              <th
+                                style={{ ...styles.th, cursor: "pointer", userSelect: "none" }}
+                                onClick={() => toggleSort("lectura")}
+                              >
+                                Última lectura real
+                                {sortField === "lectura" &&
+                                  (sortDir === "desc" ? (
+                                    <ChevronDown size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                  ) : (
+                                    <ChevronUp size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                                  ))}
+                              </th>
+                            )}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sortWells(g.wells).map((r, i) => {
+                            const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+                            return (
+                              <tr key={i}>
+                                <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                                <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>
+                                  {r.eui ? r.eui.toUpperCase() : "—"}
+                                </td>
+                                {groupBy !== "illa" && <td style={styles.td}>{getIlla(r.pozo)}</td>}
+                                <td style={styles.td}>{r.remesa || "—"}</td>
+                                {groupBy !== "installer" && <td style={styles.td}>{r.installer || "—"}</td>}
+                                <td style={styles.td}>
+                                  {r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}
+                                </td>
+                                {lastByEui && (
+                                  <td style={styles.td}>
+                                    {!r.eui ? (
+                                      "—"
+                                    ) : activity && activity.lastReal ? (
+                                      <span style={{ color: "#2a8f6c" }}>{activity.lastReal.slice(0, 16).replace("T", " ")}</span>
+                                    ) : (
+                                      <span style={{ color: "#b03a3a" }}>sense lectures reals</span>
+                                    )}
+                                  </td>
+                                )}
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ))}
             </div>
           </>
         )}
@@ -315,6 +730,7 @@ function MuntatgesView() {
 
 export default function App() {
   const params = new URLSearchParams(window.location.search);
+
   if (params.get("vista") === "muntatges") return <MuntatgesView />;
   return <NivellApp />;
 }
@@ -436,11 +852,32 @@ function NivellApp() {
       const rTsIdx = findCol(rHeaders, [/marca\s*de\s*temps/i, /timestamp/i]);
       const rPayloadIdx = findCol(rHeaders, [/payload/i]);
 
-      const groups = new Map(); // pozo -> date -> {pressures,temps,conds,nivels,count}
+      const groups = new Map(); // pozo -> date -> bucket
       const euisInFile = new Set();
       let totalReadings = 0;
       let matchedReadings = 0;
       let decodedReadings = 0;
+
+      const ensureBucket = (pozo, date, info) => {
+        if (!groups.has(pozo)) groups.set(pozo, new Map());
+        const byDate = groups.get(pozo);
+        if (!byDate.has(date)) {
+          byDate.set(date, {
+            pressures: [],
+            temps: [],
+            conds: [],
+            nivels: [],
+            batteries: [],
+            errors: new Set(),
+            gpio1: undefined,
+            gpio2: undefined,
+            deviceInfo: null,
+            cota: info.cota,
+            cable: info.cable,
+          });
+        }
+        return byDate.get(date);
+      };
 
       for (let r = 1; r < readSheet.rows.length; r++) {
         const row = readSheet.rows[r];
@@ -453,24 +890,62 @@ function NivellApp() {
         if (!info) continue;
         matchedReadings++;
         const decoded = decodePayload(row[rPayloadIdx]);
-        if (!decoded || decoded.pressureBar === undefined) continue;
-        decodedReadings++;
+        if (!decoded) continue;
 
         const ts = row[rTsIdx];
-        const date = String(ts || "").slice(0, 10) || "sin-fecha";
-        const mH2O = decoded.pressureBar * BAR_TO_MH2O;
-        const nivel = info.cable - mH2O;
+        const uplinkDate = String(ts || "").slice(0, 10) || "sin-fecha";
+        let hadMeasurement = false;
 
-        if (!groups.has(info.pozo)) groups.set(info.pozo, new Map());
-        const byDate = groups.get(info.pozo);
-        if (!byDate.has(date)) {
-          byDate.set(date, { pressures: [], temps: [], conds: [], nivels: [], cota: info.cota, cable: info.cable });
+        const hasDirectSignal =
+          decoded.pressureBar !== undefined ||
+          decoded.tempC !== undefined ||
+          decoded.condMScm !== undefined ||
+          decoded.battery !== undefined ||
+          decoded.errors.length ||
+          decoded.gpio1 !== undefined ||
+          decoded.gpio2 !== undefined ||
+          decoded.deviceInfo;
+
+        if (hasDirectSignal) {
+          const bucket = ensureBucket(info.pozo, uplinkDate, info);
+          if (decoded.pressureBar !== undefined) {
+            const mH2O = decoded.pressureBar * BAR_TO_MH2O;
+            bucket.pressures.push(decoded.pressureBar);
+            bucket.nivels.push(info.cable - mH2O);
+            hadMeasurement = true;
+          }
+          if (decoded.tempC !== undefined) {
+            bucket.temps.push(decoded.tempC);
+            hadMeasurement = true;
+          }
+          if (decoded.condMScm !== undefined) {
+            bucket.conds.push(decoded.condMScm);
+            hadMeasurement = true;
+          }
+          if (decoded.battery !== undefined) bucket.batteries.push(decoded.battery);
+          decoded.errors.forEach((e) => bucket.errors.add(e));
+          if (decoded.gpio1 !== undefined) bucket.gpio1 = decoded.gpio1;
+          if (decoded.gpio2 !== undefined) bucket.gpio2 = decoded.gpio2;
+          if (decoded.deviceInfo) bucket.deviceInfo = { ...bucket.deviceInfo, ...decoded.deviceInfo };
         }
-        const bucket = byDate.get(date);
-        bucket.pressures.push(decoded.pressureBar);
-        if (decoded.tempC !== undefined) bucket.temps.push(decoded.tempC);
-        if (decoded.condMScm !== undefined) bucket.conds.push(decoded.condMScm);
-        bucket.nivels.push(nivel);
+
+        if (decoded.historical && decoded.historical.length) {
+          for (const h of decoded.historical) {
+            if (h.pressureBar === undefined && h.tempC === undefined && h.condMScm === undefined) continue;
+            const hDate = h.timestamp.toISOString().slice(0, 10);
+            const bucket = ensureBucket(info.pozo, hDate, info);
+            if (h.pressureBar !== undefined) {
+              const mH2O = h.pressureBar * BAR_TO_MH2O;
+              bucket.pressures.push(h.pressureBar);
+              bucket.nivels.push(info.cable - mH2O);
+            }
+            if (h.tempC !== undefined) bucket.temps.push(h.tempC);
+            if (h.condMScm !== undefined) bucket.conds.push(h.condMScm);
+            hadMeasurement = true;
+          }
+        }
+
+        if (hadMeasurement) decodedReadings++;
       }
 
       const noSignal = [];
@@ -483,6 +958,17 @@ function NivellApp() {
 
       const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
 
+      const deviceInfoSummary = (d) => {
+        if (!d) return null;
+        const parts = [];
+        if (d.serial) parts.push(`Sèrie ${d.serial}`);
+        if (d.firmware) parts.push(`FW ${d.firmware}`);
+        if (d.hardware) parts.push(`HW ${d.hardware}`);
+        if (d.classType) parts.push(d.classType);
+        if (d.powerOn) parts.push("power_on");
+        return parts.join(" · ") || null;
+      };
+
       const groupList = Array.from(groups.entries())
         .map(([pozo, byDate]) => {
           const dates = Array.from(byDate.entries())
@@ -490,12 +976,17 @@ function NivellApp() {
               date,
               n: b.pressures.length,
               pressureBar: avg(b.pressures),
-              pressureMH2O: avg(b.pressures) * BAR_TO_MH2O,
+              pressureMH2O: b.pressures.length ? avg(b.pressures) * BAR_TO_MH2O : null,
               tempC: avg(b.temps),
               condMScm: avg(b.conds),
               nivel: avg(b.nivels),
               cota: b.cota,
               cable: b.cable,
+              battery: avg(b.batteries),
+              errors: Array.from(b.errors),
+              gpio1: b.gpio1,
+              gpio2: b.gpio2,
+              deviceInfo: deviceInfoSummary(b.deviceInfo),
             }))
             .sort((a, b) => (a.date < b.date ? 1 : -1));
           return { pozo, dates };
@@ -522,6 +1013,9 @@ function NivellApp() {
     }
   }, []);
 
+  const [visibleCols, setVisibleCols] = useState({ battery: true, errors: true, gpio: true, deviceInfo: true });
+  const toggleCol = (key) => setVisibleCols((c) => ({ ...c, [key]: !c[key] }));
+
   const canProcess = assocData && readingsFile && !loading;
 
   const filteredGroups = useMemo(() => {
@@ -540,13 +1034,18 @@ function NivellApp() {
           Pozo: g.pozo,
           Fecha: d.date,
           "Lecturas": d.n,
-          "Presión media (bar)": +d.pressureBar.toFixed(4),
-          "Presión media (mH2O)": +d.pressureMH2O.toFixed(4),
+          "Presión media (bar)": d.pressureBar !== null ? +d.pressureBar.toFixed(4) : "",
+          "Presión media (mH2O)": d.pressureMH2O !== null ? +d.pressureMH2O.toFixed(4) : "",
           "Temperatura media (°C)": d.tempC !== null ? +d.tempC.toFixed(2) : "",
           "Conductividad media (mS/cm)": d.condMScm !== null ? +d.condMScm.toFixed(3) : "",
           "Cota (m)": d.cota,
           "Cable fins cota (m)": d.cable,
-          "Nivel freático (m)": +d.nivel.toFixed(3),
+          "Nivel freático (m)": d.nivel !== null ? +d.nivel.toFixed(3) : "",
+          "Batería (%)": d.battery !== null ? +d.battery.toFixed(0) : "",
+          "Errores Modbus": d.errors && d.errors.length ? d.errors.join(", ") : "",
+          "GPIO1": d.gpio1 !== undefined ? d.gpio1 : "",
+          "GPIO2": d.gpio2 !== undefined ? d.gpio2 : "",
+          "Info dispositivo": d.deviceInfo || "",
         });
       });
     });
@@ -722,6 +1221,24 @@ function NivellApp() {
               )}
             </div>
 
+            <div style={styles.segmentGroup}>
+              <span style={styles.segmentLabel}>Columnes:</span>
+              {[
+                ["battery", "Bateria"],
+                ["errors", "Errors Modbus"],
+                ["gpio", "GPIO"],
+                ["deviceInfo", "Info dispositiu"],
+              ].map(([key, label]) => (
+                <button
+                  key={key}
+                  style={{ ...styles.segmentBtn, ...(visibleCols[key] ? styles.segmentBtnActive : {}) }}
+                  onClick={() => toggleCol(key)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
             <div style={styles.groupsWrap}>
               {filteredGroups.length === 0 && (
                 <div style={styles.emptyMsg}>Cap pou coincideix amb aquest filtre.</div>
@@ -749,6 +1266,10 @@ function NivellApp() {
                             <th style={styles.th}>Temp. (°C)</th>
                             <th style={styles.th}>Conductivitat (mS/cm)</th>
                             <th style={{ ...styles.th, color: "#2a6f68" }}>Nivell freàtic (m)</th>
+                            {visibleCols.battery && <th style={styles.th}>Bateria (%)</th>}
+                            {visibleCols.errors && <th style={styles.th}>Errors Modbus</th>}
+                            {visibleCols.gpio && <th style={styles.th}>GPIO 1/2</th>}
+                            {visibleCols.deviceInfo && <th style={styles.th}>Info dispositiu</th>}
                           </tr>
                         </thead>
                         <tbody>
@@ -761,6 +1282,26 @@ function NivellApp() {
                               <td style={styles.td}>{fmt(d.tempC, 2)}</td>
                               <td style={styles.td}>{d.condMScm !== null ? fmt(d.condMScm, 3) : "—"}</td>
                               <td style={{ ...styles.td, fontWeight: 600, color: "#1f4b46" }}>{fmt(d.nivel, 3)}</td>
+                              {visibleCols.battery && (
+                                <td style={styles.td}>{d.battery !== null ? fmt(d.battery, 0) : "—"}</td>
+                              )}
+                              {visibleCols.errors && (
+                                <td style={styles.td}>
+                                  {d.errors && d.errors.length ? (
+                                    <span style={{ color: "#b03a3a" }}>{d.errors.join(", ")}</span>
+                                  ) : (
+                                    "—"
+                                  )}
+                                </td>
+                              )}
+                              {visibleCols.gpio && (
+                                <td style={styles.td}>
+                                  {d.gpio1 !== undefined || d.gpio2 !== undefined
+                                    ? `${d.gpio1 ?? "—"} / ${d.gpio2 ?? "—"}`
+                                    : "—"}
+                                </td>
+                              )}
+                              {visibleCols.deviceInfo && <td style={styles.td}>{d.deviceInfo || "—"}</td>}
                             </tr>
                           ))}
                         </tbody>
@@ -1049,6 +1590,20 @@ const styles = {
     flex: "1 1 260px",
   },
   searchRow: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginTop: 22 },
+  controlsRow: { display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap", marginTop: 22 },
+  segmentGroup: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },
+  segmentLabel: { fontSize: 12.5, color: "#7c9490", marginRight: 2 },
+  segmentBtn: {
+    background: "#fff",
+    border: "1px solid #e1ecea",
+    borderRadius: 7,
+    padding: "6px 12px",
+    fontSize: 12.5,
+    color: "#4a615d",
+    cursor: "pointer",
+  },
+  segmentBtnActive: { background: "#1f5e59", borderColor: "#1f5e59", color: "#fff", fontWeight: 600 },
+  segmentBtnDisabled: { opacity: 0.4, cursor: "not-allowed" },
   searchInput: { border: "none", outline: "none", fontSize: 13.5, flex: 1, background: "transparent" },
   groupsWrap: { marginTop: 16, display: "flex", flexDirection: "column", gap: 10 },
   emptyMsg: { color: "#7c9490", fontSize: 13.5, padding: "20px 0" },
