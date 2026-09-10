@@ -164,6 +164,7 @@ async function parseMuntatgesFromWorkbook(assocWb) {
   }
   const headers = sheet.headers;
   const pozoIdx = findCol(headers, [/c[oó]digo\s*pozo/i, /^codi$/i]);
+  const euiIdx = findCol(headers, [/dev\s*eui/i]);
   const cotaIdx = findCol(headers, [/^cota$/i]);
   const installerIdx = findCol(headers, [/instal·?lador/i, /instalador/i]);
   const dateIdx = findCol(headers, [/data\s*de\s*muntatge/i]);
@@ -177,6 +178,7 @@ async function parseMuntatgesFromWorkbook(assocWb) {
     if (!pozo) continue;
     rows.push({
       pozo: String(pozo),
+      eui: euiIdx !== -1 ? normEUI(row[euiIdx]) : "",
       cota: cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null,
       installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
       date: dateIdx !== -1 ? String(row[dateIdx] || "").trim() : "",
@@ -184,6 +186,33 @@ async function parseMuntatgesFromWorkbook(assocWb) {
     });
   }
   return rows;
+}
+
+async function parseLastReadingByEui(file) {
+  const wb = await readWorkbook(file);
+  const sheet = findSheetWithHeader(wb, [/dev\s*eui/i, /payload/i]);
+  if (!sheet) {
+    throw new Error('No encuentro columnas "DevEUI" y "Payload" en este archivo de lecturas.');
+  }
+  const euiIdx = findCol(sheet.headers, [/dev\s*eui/i]);
+  const tsIdx = findCol(sheet.headers, [/marca\s*de\s*temps/i, /timestamp/i]);
+  const payloadIdx = findCol(sheet.headers, [/payload/i]);
+
+  const lastByEui = new Map(); // eui -> { lastAny, lastReal }
+  for (let r = 1; r < sheet.rows.length; r++) {
+    const row = sheet.rows[r];
+    if (!row || !row.length) continue;
+    const eui = normEUI(row[euiIdx]);
+    if (!eui || IGNORED_EUIS.has(eui)) continue;
+    const ts = String(row[tsIdx] || "");
+    const decoded = decodePayload(row[payloadIdx]);
+    const isReal = !!(decoded && decoded.pressureBar !== undefined);
+    const entry = lastByEui.get(eui) || { lastAny: "", lastReal: "" };
+    if (ts > entry.lastAny) entry.lastAny = ts;
+    if (isReal && ts > entry.lastReal) entry.lastReal = ts;
+    lastByEui.set(eui, entry);
+  }
+  return lastByEui;
 }
 
 function parseMuntatgeDate(s) {
@@ -198,6 +227,10 @@ function MuntatgesView() {
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
+  const [readingsFile, setReadingsFile] = useState(null);
+  const [lastByEui, setLastByEui] = useState(null);
+  const [readingsError, setReadingsError] = useState(null);
+  const [readingsLoading, setReadingsLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -216,6 +249,21 @@ function MuntatgesView() {
   useEffect(() => {
     load();
   }, [load]);
+
+  const handleReadingsFile = useCallback(async (file) => {
+    setReadingsFile(file);
+    setReadingsLoading(true);
+    setReadingsError(null);
+    setLastByEui(null);
+    try {
+      const map = await parseLastReadingByEui(file);
+      setLastByEui(map);
+    } catch (e) {
+      setReadingsError(e.message || String(e));
+    } finally {
+      setReadingsLoading(false);
+    }
+  }, []);
 
   const filtered = useMemo(() => {
     if (!rows) return [];
@@ -245,6 +293,23 @@ function MuntatgesView() {
       </div>
 
       <div style={styles.container}>
+        <UploadCard
+          label="Fitxer de lectures (opcional)"
+          hint="Puja l'export de lectures per veure l'última comunicació real de cada pou — arrossega'l aquí o fes clic"
+          file={readingsFile}
+          onFile={handleReadingsFile}
+          inputId="muntatges-readings-input"
+          extra={
+            readingsError ? (
+              <span style={{ color: "#a86a2d" }}>{readingsError}</span>
+            ) : readingsLoading ? (
+              <span>Analitzant…</span>
+            ) : lastByEui ? (
+              <span style={{ color: "#2a8f6c", fontWeight: 600 }}>{lastByEui.size} DevEUI amb activitat al fitxer</span>
+            ) : null
+          }
+        />
+
         <div style={styles.searchRow}>
           <div style={styles.searchBar}>
             <Search size={16} color="#7c9490" />
@@ -286,18 +351,33 @@ function MuntatgesView() {
                       <th style={styles.th}>Instal·lador</th>
                       <th style={styles.th}>Data de muntatge</th>
                       <th style={styles.th}>Acabat</th>
+                      {lastByEui && <th style={styles.th}>Última lectura real</th>}
                     </tr>
                   </thead>
                   <tbody>
-                    {filtered.map((r, i) => (
-                      <tr key={i}>
-                        <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
-                        <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
-                        <td style={styles.td}>{r.installer || "—"}</td>
-                        <td style={styles.td}>{r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}</td>
-                        <td style={styles.td}>{r.acabat || "—"}</td>
-                      </tr>
-                    ))}
+                    {filtered.map((r, i) => {
+                      const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+                      return (
+                        <tr key={i}>
+                          <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                          <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
+                          <td style={styles.td}>{r.installer || "—"}</td>
+                          <td style={styles.td}>{r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}</td>
+                          <td style={styles.td}>{r.acabat || "—"}</td>
+                          {lastByEui && (
+                            <td style={styles.td}>
+                              {!r.eui ? (
+                                "—"
+                              ) : activity && activity.lastReal ? (
+                                <span style={{ color: "#2a8f6c" }}>{activity.lastReal.slice(0, 16).replace("T", " ")}</span>
+                              ) : (
+                                <span style={{ color: "#b03a3a" }}>sense lectures reals</span>
+                              )}
+                            </td>
+                          )}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
