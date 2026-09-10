@@ -1,6 +1,8 @@
 import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
-import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, ChevronUp, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
 
 const BAR_TO_MH2O = 10.19716;
 const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
@@ -170,6 +172,7 @@ async function parseMuntatgesFromWorkbook(assocWb) {
   const installerIdx = findCol(headers, [/instal·?lador/i, /instalador/i]);
   const dateIdx = findCol(headers, [/data\s*de\s*muntatge/i]);
   const acabatIdx = findCol(headers, [/^acabat$/i]);
+  const remesaIdx = findCol(headers, [/^remesa$/i]);
 
   const rows = [];
   for (let r = 1; r < sheet.rows.length; r++) {
@@ -187,6 +190,7 @@ async function parseMuntatgesFromWorkbook(assocWb) {
       installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
       date: dateIdx !== -1 ? normalizeMuntatgeDateString(row[dateIdx]) : "",
       acabat: acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "",
+      remesa: remesaIdx !== -1 ? String(row[remesaIdx] || "").trim() : "",
     });
   }
   return rows;
@@ -260,7 +264,7 @@ function MuntatgesView() {
   const [lastByEui, setLastByEui] = useState(null);
   const [readingsError, setReadingsError] = useState(null);
   const [readingsLoading, setReadingsLoading] = useState(false);
-  const [sortDir, setSortDir] = useState("desc"); // "desc" = més recent primer
+  const [groupSortDir, setGroupSortDir] = useState({}); // installer -> "desc" | "asc"
   const [collapsed, setCollapsed] = useState({});
 
   const load = useCallback(async () => {
@@ -296,17 +300,18 @@ function MuntatgesView() {
     }
   }, []);
 
-  const dateSorter = useCallback(
-    (a, b) => {
+  const sortWells = (wells, dir) =>
+    [...wells].sort((a, b) => {
       const da = parseMuntatgeDate(a.date);
       const db = parseMuntatgeDate(b.date);
-      if (da && db) return sortDir === "desc" ? db - da : da - db;
+      if (da && db) return dir === "desc" ? db - da : da - db;
       if (da) return -1;
       if (db) return 1;
       return a.pozo.localeCompare(b.pozo);
-    },
-    [sortDir]
-  );
+    });
+
+  const toggleGroupSort = (installer) =>
+    setGroupSortDir((d) => ({ ...d, [installer]: (d[installer] || "desc") === "desc" ? "asc" : "desc" }));
 
   const groups = useMemo(() => {
     if (!rows) return [];
@@ -319,12 +324,38 @@ function MuntatgesView() {
       byInstaller.get(key).push(r);
     }
     return Array.from(byInstaller.entries())
-      .map(([installer, wells]) => ({ installer, wells: [...wells].sort(dateSorter) }))
+      .map(([installer, wells]) => ({ installer, wells }))
       .sort((a, b) => a.installer.localeCompare(b.installer));
-  }, [rows, query, dateSorter]);
+  }, [rows, query]);
 
   const pendents = useMemo(() => (rows || []).filter((r) => !parseMuntatgeDate(r.date)), [rows]);
   const toggle = (installer) => setCollapsed((c) => ({ ...c, [installer]: !c[installer] }));
+
+  const exportPdf = () => {
+    const doc = new jsPDF();
+    doc.setFontSize(14);
+    doc.text("Muntatges — Instal·lacions JFA", 14, 15);
+    doc.setFontSize(9);
+    doc.setTextColor(120);
+    doc.text(`Generat el ${new Date().toLocaleString("es-ES")}`, 14, 21);
+
+    const head = [["Pou", "Remesa", "Instal·lador", "Data de muntatge", ...(lastByEui ? ["Última lectura real"] : [])]];
+    const body = [];
+    groups.forEach((g) => {
+      const dir = groupSortDir[g.installer] || "desc";
+      sortWells(g.wells, dir).forEach((r) => {
+        const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+        const row = [r.pozo, r.remesa || "—", g.installer, r.date || "pendent"];
+        if (lastByEui) {
+          row.push(!r.eui ? "—" : activity && activity.lastReal ? activity.lastReal.slice(0, 16).replace("T", " ") : "sense lectures reals");
+        }
+        body.push(row);
+      });
+    });
+
+    autoTable(doc, { head, body, startY: 26, styles: { fontSize: 8 }, headStyles: { fillColor: [31, 94, 89] } });
+    doc.save(`muntatges_${new Date().toISOString().slice(0, 10)}.pdf`);
+  };
 
   return (
     <div style={styles.page}>
@@ -364,9 +395,9 @@ function MuntatgesView() {
               onChange={(e) => setQuery(e.target.value)}
             />
           </div>
-          <button style={styles.secondaryBtn} onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}>
-            <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
-            {sortDir === "desc" ? "Més recent primer" : "Més antic primer"}
+          <button style={styles.secondaryBtn} onClick={exportPdf} disabled={!rows || !rows.length}>
+            <Download size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            Descarregar PDF
           </button>
           <button style={styles.secondaryBtn} onClick={load} disabled={loading}>
             <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
@@ -404,16 +435,28 @@ function MuntatgesView() {
                         <thead>
                           <tr>
                             <th style={styles.th}>Pou</th>
-                            <th style={styles.th}>Data de muntatge</th>
+                            <th style={styles.th}>Remesa</th>
+                            <th
+                              style={{ ...styles.th, cursor: "pointer", userSelect: "none" }}
+                              onClick={() => toggleGroupSort(g.installer)}
+                            >
+                              Data de muntatge
+                              {(groupSortDir[g.installer] || "desc") === "desc" ? (
+                                <ChevronDown size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                              ) : (
+                                <ChevronUp size={12} style={{ marginLeft: 4, verticalAlign: "-1px" }} />
+                              )}
+                            </th>
                             {lastByEui && <th style={styles.th}>Última lectura real</th>}
                           </tr>
                         </thead>
                         <tbody>
-                          {g.wells.map((r, i) => {
+                          {sortWells(g.wells, groupSortDir[g.installer] || "desc").map((r, i) => {
                             const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
                             return (
                               <tr key={i}>
                                 <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                                <td style={styles.td}>{r.remesa || "—"}</td>
                                 <td style={styles.td}>
                                   {r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}
                                 </td>
