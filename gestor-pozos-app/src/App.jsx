@@ -1,11 +1,13 @@
-import React, { useState, useMemo, useCallback, useEffect } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
-import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet } from "lucide-react";
+import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
 
 const BAR_TO_MH2O = 10.19716;
 const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
 const ASSOC_CSV_URL =
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vQAi-_8-SD1mogQMDKb5j2kfl0xzJub5kXE1F0YTnkVV_qiBBjYFfTOTRsE-_ylRNcTxu9vKbswww2W/pub?gid=1661818251&single=true&output=csv";
+// DevEUI que no corresponen a pous reals i s'han d'ignorar sempre
+const IGNORED_EUIS = new Set(["24e124847f420841"]); // mesurador de cobertura
 
 function normEUI(s) {
   return String(s || "").replace(/[^0-9a-fA-F]/g, "").toLowerCase();
@@ -155,7 +157,169 @@ function saveAssocToStorage(data) {
   }
 }
 
+async function parseMuntatgesFromWorkbook(assocWb) {
+  const sheet = findSheetWithHeader(assocWb, [/c[oó]digo\s*pozo/i, /data\s*de\s*muntatge/i]);
+  if (!sheet) {
+    throw new Error('No encuentro una hoja con columnas "Código pozo" y "Data de muntatge".');
+  }
+  const headers = sheet.headers;
+  const pozoIdx = findCol(headers, [/c[oó]digo\s*pozo/i, /^codi$/i]);
+  const cotaIdx = findCol(headers, [/^cota$/i]);
+  const installerIdx = findCol(headers, [/instal·?lador/i, /instalador/i]);
+  const dateIdx = findCol(headers, [/data\s*de\s*muntatge/i]);
+  const acabatIdx = findCol(headers, [/^acabat$/i]);
+
+  const rows = [];
+  for (let r = 1; r < sheet.rows.length; r++) {
+    const row = sheet.rows[r];
+    if (!row || !row.length) continue;
+    const pozo = pozoIdx !== -1 ? row[pozoIdx] : null;
+    if (!pozo) continue;
+    rows.push({
+      pozo: String(pozo),
+      cota: cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null,
+      installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
+      date: dateIdx !== -1 ? String(row[dateIdx] || "").trim() : "",
+      acabat: acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "",
+    });
+  }
+  return rows;
+}
+
+function parseMuntatgeDate(s) {
+  // Formats vistos: "31/07/2026" o "25/08/2026 7:51:00"
+  const m = String(s || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return null;
+  return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+}
+
+function MuntatgesView() {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const wb = await fetchWorkbookFromUrl(ASSOC_CSV_URL);
+      const data = await parseMuntatgesFromWorkbook(wb);
+      setRows(data);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const filtered = useMemo(() => {
+    if (!rows) return [];
+    const q = query.trim().toLowerCase();
+    const list = q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
+    return [...list].sort((a, b) => {
+      const da = parseMuntatgeDate(a.date);
+      const db = parseMuntatgeDate(b.date);
+      if (da && db) return db - da; // més recent primer
+      if (da) return -1;
+      if (db) return 1;
+      return a.pozo.localeCompare(b.pozo);
+    });
+  }, [rows, query]);
+
+  const muntats = filtered.filter((r) => parseMuntatgeDate(r.date));
+  const pendents = filtered.filter((r) => !parseMuntatgeDate(r.date));
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.headerBar}>
+        <div style={styles.brand}>
+          <Waves size={22} color="#e8f3f2" />
+          <span style={styles.brandText}>Muntatges</span>
+        </div>
+        <span style={styles.brandSub}>Data de muntatge i instal·lador per pou</span>
+      </div>
+
+      <div style={styles.container}>
+        <div style={styles.searchRow}>
+          <div style={styles.searchBar}>
+            <Search size={16} color="#7c9490" />
+            <input
+              style={styles.searchInput}
+              placeholder="Filtrar per codi de pou…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+          <button style={styles.secondaryBtn} onClick={load} disabled={loading}>
+            <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            {loading ? "Actualitzant…" : "Actualitzar ara"}
+          </button>
+        </div>
+
+        {error && (
+          <div style={styles.errorBox}>
+            <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: 2 }} />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {rows && (
+          <>
+            <div style={styles.statsRow}>
+              <Stat label="Pous muntats" value={muntats.length} />
+              <Stat label="Pendents de muntar" value={pendents.length} />
+              <Stat label="Total pous al full" value={rows.length} />
+            </div>
+
+            <div style={{ ...styles.groupCard, marginTop: 22 }}>
+              <div style={styles.tableWrap}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      <th style={styles.th}>Pou</th>
+                      <th style={styles.th}>Cota</th>
+                      <th style={styles.th}>Instal·lador</th>
+                      <th style={styles.th}>Data de muntatge</th>
+                      <th style={styles.th}>Acabat</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filtered.map((r, i) => (
+                      <tr key={i}>
+                        <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                        <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
+                        <td style={styles.td}>{r.installer || "—"}</td>
+                        <td style={styles.td}>{r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}</td>
+                        <td style={styles.td}>{r.acabat || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      <footer style={styles.footer}>
+        © {new Date().getFullYear()} Instal·lacions JFA. Tots els drets reservats.
+      </footer>
+    </div>
+  );
+}
+
 export default function App() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("vista") === "muntatges") return <MuntatgesView />;
+  return <NivellApp />;
+}
+
+function NivellApp() {
   const [assocData, setAssocData] = useState(null); // { map, excluded, fileName, savedAt, source }
   const [assocLoading, setAssocLoading] = useState(true);
   const [assocError, setAssocError] = useState(null);
@@ -169,6 +333,13 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState({});
   const [showExcluded, setShowExcluded] = useState(false);
+  const [showNoSignal, setShowNoSignal] = useState(false);
+  const noSignalRef = useRef(null);
+
+  const jumpToNoSignal = () => {
+    setShowNoSignal(true);
+    setTimeout(() => noSignalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
+  };
 
   const syncFromSheet = useCallback(async ({ silent } = {}) => {
     if (!silent) setAssocLoading(true);
@@ -242,7 +413,7 @@ export default function App() {
         if (!row || !row.length) continue;
         rows++;
         const eui = normEUI(row[euiIdx]);
-        if (eui) wells.add(eui);
+        if (eui && !IGNORED_EUIS.has(eui)) wells.add(eui);
       }
       setReadingsPreview({ rows, uniqueWells: wells.size });
     } catch (e) {
@@ -266,6 +437,7 @@ export default function App() {
       const rPayloadIdx = findCol(rHeaders, [/payload/i]);
 
       const groups = new Map(); // pozo -> date -> {pressures,temps,conds,nivels,count}
+      const euisInFile = new Set();
       let totalReadings = 0;
       let matchedReadings = 0;
       let decodedReadings = 0;
@@ -274,8 +446,9 @@ export default function App() {
         const row = readSheet.rows[r];
         if (!row || !row.length) continue;
         const eui = normEUI(row[rEuiIdx]);
-        if (!eui) continue;
+        if (!eui || IGNORED_EUIS.has(eui)) continue;
         totalReadings++;
+        euisInFile.add(eui);
         const info = assocMap.get(eui);
         if (!info) continue;
         matchedReadings++;
@@ -299,6 +472,14 @@ export default function App() {
         if (decoded.condMScm !== undefined) bucket.conds.push(decoded.condMScm);
         bucket.nivels.push(nivel);
       }
+
+      const noSignal = [];
+      for (const [eui, info] of assocMap.entries()) {
+        if (!euisInFile.has(eui)) {
+          noSignal.push({ pozo: info.pozo, eui, cota: info.cota, cable: info.cable });
+        }
+      }
+      noSignal.sort((a, b) => a.pozo.localeCompare(b.pozo));
 
       const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
 
@@ -324,7 +505,15 @@ export default function App() {
       setResults({
         groups: groupList,
         excluded: [...assocExcluded].sort((a, b) => a.pozo.localeCompare(b.pozo)),
-        stats: { totalReadings, matchedReadings, decodedReadings, wellsOk: assocMap.size, wellsExcluded: assocExcluded.length },
+        noSignal,
+        stats: {
+          totalReadings,
+          matchedReadings,
+          decodedReadings,
+          wellsOk: assocMap.size,
+          wellsExcluded: assocExcluded.length,
+          wellsNoSignal: noSignal.length,
+        },
       });
     } catch (e) {
       setError(e.message || String(e));
@@ -365,6 +554,12 @@ export default function App() {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Nivel freático");
 
+    if (results.noSignal.length) {
+      const wsNoSignal = XLSX.utils.json_to_sheet(
+        results.noSignal.map((x) => ({ Pozo: x.pozo, DevEUI: x.eui, "Cota (m)": x.cota, "Cable fins cota (m)": x.cable }))
+      );
+      XLSX.utils.book_append_sheet(wb, wsNoSignal, "Sin señal");
+    }
     if (results.excluded.length) {
       const wsExc = XLSX.utils.json_to_sheet(
         results.excluded.map((x) => ({ Pozo: x.pozo, DevEUI: x.eui, Motivo: x.motivo }))
@@ -494,6 +689,7 @@ export default function App() {
             <div style={styles.statsRow}>
               <Stat label="Pous amb cota vàlida" value={results.stats.wellsOk} />
               <Stat label="Pous exclosos" value={results.stats.wellsExcluded} warn />
+              <Stat label="Pous instal·lats sense senyal" value={results.stats.wellsNoSignal} warn onClick={results.stats.wellsNoSignal > 0 ? jumpToNoSignal : undefined} />
               <Stat label="Lectures totals" value={results.stats.totalReadings} />
               <Stat label="Lectures amb pou associat" value={results.stats.matchedReadings} />
               <Stat label="Lectures decodificades" value={results.stats.decodedReadings} />
@@ -575,6 +771,40 @@ export default function App() {
               ))}
             </div>
 
+            {results.noSignal.length > 0 && (
+              <div style={styles.noSignalBox} ref={noSignalRef}>
+                <button style={styles.noSignalHeader} onClick={() => setShowNoSignal((s) => !s)}>
+                  {showNoSignal ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  <RadioTower size={15} color="#b03a3a" style={{ margin: "0 6px" }} />
+                  {results.noSignal.length} pous instal·lats (amb cota vàlida) que no han emès cap lectura en aquest fitxer
+                </button>
+                {showNoSignal && (
+                  <div style={styles.tableWrap}>
+                    <table style={styles.table}>
+                      <thead>
+                        <tr>
+                          <th style={styles.th}>Pou</th>
+                          <th style={styles.th}>DevEUI</th>
+                          <th style={styles.th}>Cota</th>
+                          <th style={styles.th}>Cable fins cota</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {results.noSignal.map((x, i) => (
+                          <tr key={i}>
+                            <td style={styles.td}>{x.pozo}</td>
+                            <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{x.eui}</td>
+                            <td style={styles.td}>{fmt(x.cota, 1)} m</td>
+                            <td style={styles.td}>{fmt(x.cable, 2)} m</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+
             {results.excluded.length > 0 && (
               <div style={styles.excludedBox}>
                 <button style={styles.excludedHeader} onClick={() => setShowExcluded((s) => !s)}>
@@ -609,6 +839,10 @@ export default function App() {
           </>
         )}
       </div>
+
+      <footer style={styles.footer}>
+        © {new Date().getFullYear()} Instal·lacions JFA. Tots els drets reservats.
+      </footer>
     </div>
   );
 }
@@ -655,9 +889,15 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
   );
 }
 
-function Stat({ label, value, warn }) {
+function Stat({ label, value, warn, onClick }) {
+  const clickable = typeof onClick === "function";
   return (
-    <div style={styles.statCard}>
+    <div
+      style={{ ...styles.statCard, ...(clickable ? styles.statCardClickable : {}) }}
+      onClick={onClick}
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+    >
       <div style={{ ...styles.statValue, color: warn && value > 0 ? "#a86a2d" : "#1f4b46" }}>{value}</div>
       <div style={styles.statLabel}>{label}</div>
     </div>
@@ -670,6 +910,16 @@ const styles = {
     background: "#f4f8f7",
     fontFamily: "'Segoe UI', Roboto, -apple-system, sans-serif",
     color: "#1c2b29",
+    display: "flex",
+    flexDirection: "column",
+  },
+  footer: {
+    marginTop: "auto",
+    textAlign: "center",
+    padding: "18px 20px",
+    fontSize: 12,
+    color: "#7c9490",
+    borderTop: "1px solid #e1ecea",
   },
   headerBar: {
     background: "linear-gradient(120deg, #123c3a, #1f5e59)",
@@ -784,6 +1034,7 @@ const styles = {
     padding: "12px 18px",
     minWidth: 130,
   },
+  statCardClickable: { cursor: "pointer", transition: "box-shadow .15s, border-color .15s" },
   statValue: { fontSize: 22, fontWeight: 700 },
   statLabel: { fontSize: 11.5, color: "#7c9490", marginTop: 2 },
   searchBar: {
@@ -830,6 +1081,20 @@ const styles = {
   },
   td: { padding: "9px 14px", borderBottom: "1px solid #f0f5f4" },
   excludedBox: { marginTop: 22, background: "#fffaf3", border: "1px solid #f0d9b5", borderRadius: 10, overflow: "hidden" },
+  noSignalBox: { marginTop: 22, background: "#fdf2f2", border: "1px solid #f0c4c4", borderRadius: 10, overflow: "hidden" },
+  noSignalHeader: {
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    background: "transparent",
+    border: "none",
+    padding: "12px 16px",
+    cursor: "pointer",
+    fontSize: 13.5,
+    fontWeight: 600,
+    color: "#b03a3a",
+    textAlign: "left",
+  },
   excludedHeader: {
     width: "100%",
     display: "flex",
