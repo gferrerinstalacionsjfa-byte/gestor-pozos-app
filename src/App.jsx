@@ -185,7 +185,7 @@ async function parseMuntatgesFromWorkbook(assocWb) {
       cota: cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null,
       cable,
       installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
-      date: dateIdx !== -1 ? String(row[dateIdx] || "").trim() : "",
+      date: dateIdx !== -1 ? normalizeMuntatgeDateString(row[dateIdx]) : "",
       acabat: acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "",
     });
   }
@@ -217,6 +217,31 @@ async function parseLastReadingByEui(file) {
     lastByEui.set(eui, entry);
   }
   return lastByEui;
+}
+
+function excelSerialToDate(serial) {
+  const base = Date.UTC(1899, 11, 30);
+  return new Date(base + serial * 86400000);
+}
+
+function formatMuntatgeDate(d) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const datePart = `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}/${d.getUTCFullYear()}`;
+  const hasTime = d.getUTCHours() || d.getUTCMinutes() || d.getUTCSeconds();
+  if (!hasTime) return datePart;
+  return `${datePart} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function normalizeMuntatgeDateString(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(s)) return s; // ja ve en format dd/mm/aaaa
+  // número de sèrie de data del full de càlcul (dies des del 30/12/1899), a vegades amb decimals d'hora
+  const num = Number(s);
+  if (!Number.isNaN(num) && num > 1000 && num < 100000) {
+    return formatMuntatgeDate(excelSerialToDate(num));
+  }
+  return s; // valor no reconegut: es deixa tal qual, no es descarta
 }
 
 function parseMuntatgeDate(s) {
