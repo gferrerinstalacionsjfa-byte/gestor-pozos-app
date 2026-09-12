@@ -329,6 +329,7 @@ async function parseLastReadingByEui(file) {
   const payloadIdx = findCol(sheet.headers, [/payload/i]);
 
   const lastByEui = new Map(); // eui -> { lastAny, lastReal, battery, errors, gpio1, gpio2, deviceInfo }
+  const historyByEui = new Map(); // eui -> [{ ts, status, errors }]
   const deviceInfoSummary = (d) => {
     if (!d) return null;
     const parts = [];
@@ -356,6 +357,23 @@ async function parseLastReadingByEui(file) {
       deviceInfoRaw: null,
     };
     if (ts > entry.lastAny) entry.lastAny = ts;
+
+    // --- registre per a l'historial detallat (una entrada per lectura) ---
+    const hasOk =
+      !!decoded &&
+      (decoded.pressureBar !== undefined ||
+        decoded.tempC !== undefined ||
+        decoded.condMScm !== undefined ||
+        (decoded.historical && decoded.historical.some((h) => h.pressureBar !== undefined || h.tempC !== undefined || h.condMScm !== undefined)));
+    const hasErr = !!decoded && decoded.errors && decoded.errors.length > 0;
+    let status = "sense_dades";
+    if (hasOk && !hasErr) status = "ok";
+    else if (hasOk && hasErr) status = "parcial";
+    else if (!hasOk && hasErr) status = "error";
+    else if (decoded) status = "info"; // bateria/GPIO/info dispositiu/ACK sense mesura ni error
+    if (!historyByEui.has(eui)) historyByEui.set(eui, []);
+    historyByEui.get(eui).push({ ts, status, errors: decoded ? decoded.errors : [] });
+
     if (decoded) {
       const isReal = decoded.pressureBar !== undefined || decoded.tempC !== undefined || decoded.condMScm !== undefined;
       if (isReal && ts > entry.lastReal) entry.lastReal = ts;
@@ -379,8 +397,26 @@ async function parseLastReadingByEui(file) {
     entry.deviceInfo = deviceInfoSummary(entry.deviceInfoRaw);
     delete entry.deviceInfoRaw;
   }
-  return lastByEui;
+  for (const hist of historyByEui.values()) {
+    hist.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  }
+  return { lastByEui, historyByEui };
 }
+
+const READING_STATUS_COLORS = {
+  ok: "#2a8f6c",
+  parcial: "#c98a2d",
+  error: "#b03a3a",
+  info: "#c7d3d1",
+  sense_dades: "#e6ecea",
+};
+const READING_STATUS_LABELS = {
+  ok: "lectura correcta",
+  parcial: "parcial (algun paràmetre amb error)",
+  error: "error de lectura",
+  info: "missatge sense mesura (bateria/estat/info)",
+  sense_dades: "sense dades reconegudes",
+};
 
 function excelSerialToDate(serial) {
   const base = Date.UTC(1899, 11, 30);
@@ -442,6 +478,8 @@ function MuntatgesView() {
   const [query, setQuery] = useState("");
   const [readingsFile, setReadingsFile] = useState(null);
   const [lastByEui, setLastByEui] = useState(null);
+  const [historyByEui, setHistoryByEui] = useState(null);
+  const [expandedHistory, setExpandedHistory] = useState({});
   const [readingsError, setReadingsError] = useState(null);
   const [readingsLoading, setReadingsLoading] = useState(false);
   const [groupBy, setGroupBy] = useState("installer"); // "installer" | "illa" | "none"
@@ -450,6 +488,7 @@ function MuntatgesView() {
   const [collapsed, setCollapsed] = useState({});
   const [visibleCols, setVisibleCols] = useState({ battery: true, errors: true, gpio: true, deviceInfo: true });
   const toggleCol = (key) => setVisibleCols((c) => ({ ...c, [key]: !c[key] }));
+  const toggleHistory = (eui) => setExpandedHistory((c) => ({ ...c, [eui]: !c[eui] }));
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -474,9 +513,12 @@ function MuntatgesView() {
     setReadingsLoading(true);
     setReadingsError(null);
     setLastByEui(null);
+    setHistoryByEui(null);
+    setExpandedHistory({});
     try {
-      const map = await parseLastReadingByEui(file);
-      setLastByEui(map);
+      const { lastByEui: lm, historyByEui: hm } = await parseLastReadingByEui(file);
+      setLastByEui(lm);
+      setHistoryByEui(hm);
     } catch (e) {
       setReadingsError(e.message || String(e));
     } finally {
@@ -747,61 +789,86 @@ function MuntatgesView() {
                             {lastByEui && visibleCols.errors && <th style={styles.th}>Errors Modbus</th>}
                             {lastByEui && visibleCols.gpio && <th style={styles.th}>GPIO 1/2</th>}
                             {lastByEui && visibleCols.deviceInfo && <th style={styles.th}>Info dispositiu</th>}
+                            {historyByEui && <th style={styles.th}>Historial</th>}
                           </tr>
                         </thead>
                         <tbody>
                           {sortWells(g.wells).map((r, i) => {
                             const activity = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+                            const hist = historyByEui && r.eui ? historyByEui.get(r.eui) : null;
+                            const isExpanded = r.eui && expandedHistory[r.eui];
                             return (
-                              <tr key={i}>
-                                <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
-                                <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>
-                                  {r.eui ? r.eui.toUpperCase() : "—"}
-                                </td>
-                                {groupBy !== "illa" && <td style={styles.td}>{getIlla(r.pozo)}</td>}
-                                <td style={styles.td}>{r.remesa || "—"}</td>
-                                {groupBy !== "installer" && <td style={styles.td}>{r.installer || "—"}</td>}
-                                <td style={styles.td}>
-                                  {r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}
-                                </td>
-                                {lastByEui && (
-                                  <td style={styles.td}>
-                                    {!r.eui ? (
-                                      "—"
-                                    ) : activity && activity.lastReal ? (
-                                      <span style={{ color: "#2a8f6c" }}>{activity.lastReal.slice(0, 16).replace("T", " ")}</span>
-                                    ) : (
-                                      <span style={{ color: "#b03a3a" }}>sense lectures reals</span>
-                                    )}
+                              <React.Fragment key={i}>
+                                <tr>
+                                  <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                                  <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>
+                                    {r.eui ? r.eui.toUpperCase() : "—"}
                                   </td>
-                                )}
-                                {lastByEui && visibleCols.battery && (
+                                  {groupBy !== "illa" && <td style={styles.td}>{getIlla(r.pozo)}</td>}
+                                  <td style={styles.td}>{r.remesa || "—"}</td>
+                                  {groupBy !== "installer" && <td style={styles.td}>{r.installer || "—"}</td>}
                                   <td style={styles.td}>
-                                    {activity && activity.battery !== null && activity.battery !== undefined
-                                      ? activity.battery
-                                      : "—"}
+                                    {r.date || <span style={{ color: "#a86a2d" }}>pendent</span>}
                                   </td>
+                                  {lastByEui && (
+                                    <td style={styles.td}>
+                                      {!r.eui ? (
+                                        "—"
+                                      ) : activity && activity.lastReal ? (
+                                        <span style={{ color: "#2a8f6c" }}>{activity.lastReal.slice(0, 16).replace("T", " ")}</span>
+                                      ) : (
+                                        <span style={{ color: "#b03a3a" }}>sense lectures reals</span>
+                                      )}
+                                    </td>
+                                  )}
+                                  {lastByEui && visibleCols.battery && (
+                                    <td style={styles.td}>
+                                      {activity && activity.battery !== null && activity.battery !== undefined
+                                        ? activity.battery
+                                        : "—"}
+                                    </td>
+                                  )}
+                                  {lastByEui && visibleCols.errors && (
+                                    <td style={styles.td}>
+                                      {activity && activity.errors && activity.errors.length ? (
+                                        <span style={{ color: "#b03a3a" }}>{activity.errors.join(", ")}</span>
+                                      ) : (
+                                        "—"
+                                      )}
+                                    </td>
+                                  )}
+                                  {lastByEui && visibleCols.gpio && (
+                                    <td style={styles.td}>
+                                      {activity && (activity.gpio1 !== undefined || activity.gpio2 !== undefined)
+                                        ? `${activity.gpio1 ?? "—"} / ${activity.gpio2 ?? "—"}`
+                                        : "—"}
+                                    </td>
+                                  )}
+                                  {lastByEui && visibleCols.deviceInfo && (
+                                    <td style={styles.td}>{(activity && activity.deviceInfo) || "—"}</td>
+                                  )}
+                                  {historyByEui && (
+                                    <td style={styles.td}>
+                                      {hist && hist.length ? (
+                                        <button style={styles.smallLinkBtn} onClick={() => toggleHistory(r.eui)}>
+                                          {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                                          {" "}
+                                          {hist.length} lectures
+                                        </button>
+                                      ) : (
+                                        "—"
+                                      )}
+                                    </td>
+                                  )}
+                                </tr>
+                                {isExpanded && hist && (
+                                  <tr>
+                                    <td colSpan={20} style={{ ...styles.td, background: "#f7faf9" }}>
+                                      <ReadingHistorySummary history={hist} />
+                                    </td>
+                                  </tr>
                                 )}
-                                {lastByEui && visibleCols.errors && (
-                                  <td style={styles.td}>
-                                    {activity && activity.errors && activity.errors.length ? (
-                                      <span style={{ color: "#b03a3a" }}>{activity.errors.join(", ")}</span>
-                                    ) : (
-                                      "—"
-                                    )}
-                                  </td>
-                                )}
-                                {lastByEui && visibleCols.gpio && (
-                                  <td style={styles.td}>
-                                    {activity && (activity.gpio1 !== undefined || activity.gpio2 !== undefined)
-                                      ? `${activity.gpio1 ?? "—"} / ${activity.gpio2 ?? "—"}`
-                                      : "—"}
-                                  </td>
-                                )}
-                                {lastByEui && visibleCols.deviceInfo && (
-                                  <td style={styles.td}>{(activity && activity.deviceInfo) || "—"}</td>
-                                )}
-                              </tr>
+                              </React.Fragment>
                             );
                           })}
                         </tbody>
@@ -1396,6 +1463,63 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
         }}
       />
     </label>
+  );
+}
+
+function ReadingHistorySummary({ history }) {
+  const counts = { ok: 0, parcial: 0, error: 0, info: 0, sense_dades: 0 };
+  history.forEach((h) => counts[h.status]++);
+  const total = history.length;
+  const pct = (n) => (total ? Math.round((n / total) * 100) : 0);
+
+  return (
+    <div style={{ padding: "8px 4px" }}>
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 12.5, marginBottom: 10 }}>
+        <span>
+          <strong>{total}</strong> lectures totals
+        </span>
+        {counts.ok > 0 && (
+          <span style={{ color: READING_STATUS_COLORS.ok }}>
+            ● {counts.ok} correctes ({pct(counts.ok)}%)
+          </span>
+        )}
+        {counts.parcial > 0 && (
+          <span style={{ color: READING_STATUS_COLORS.parcial }}>
+            ● {counts.parcial} parcials ({pct(counts.parcial)}%)
+          </span>
+        )}
+        {counts.error > 0 && (
+          <span style={{ color: READING_STATUS_COLORS.error }}>
+            ● {counts.error} amb error ({pct(counts.error)}%)
+          </span>
+        )}
+        {counts.info > 0 && (
+          <span style={{ color: "#7c9490" }}>
+            ● {counts.info} sense mesura ({pct(counts.info)}%)
+          </span>
+        )}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 2, maxWidth: "100%" }}>
+        {history.map((h, i) => (
+          <div
+            key={i}
+            title={`${h.ts.slice(0, 16).replace("T", " ")} — ${READING_STATUS_LABELS[h.status]}${
+              h.errors && h.errors.length ? " (" + h.errors.join(", ") + ")" : ""
+            }`}
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: 2,
+              background: READING_STATUS_COLORS[h.status],
+              cursor: "default",
+            }}
+          />
+        ))}
+      </div>
+      <div style={{ fontSize: 11, color: "#9fb3ae", marginTop: 6 }}>
+        Ordre cronològic (esquerra = més antic). Passa el cursor per sobre de cada quadrat per veure la data i el detall.
+      </div>
+    </div>
   );
 }
 
