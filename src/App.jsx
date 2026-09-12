@@ -297,25 +297,28 @@ async function parseMuntatgesFromWorkbook(assocWb) {
   const remesaIdx = findCol(headers, [/^remesa$/i]);
 
   const rows = [];
+  const notMounted = [];
   for (let r = 1; r < sheet.rows.length; r++) {
     const row = sheet.rows[r];
     if (!row || !row.length) continue;
     const pozo = pozoIdx !== -1 ? row[pozoIdx] : null;
     if (!pozo) continue;
     const cable = cableIdx !== -1 ? parseCableFinsCota(row[cableIdx]) : null;
-    if (cable === null) continue; // solo pozos con medida de cable válida
-    rows.push({
-      pozo: String(pozo),
-      eui: euiIdx !== -1 ? normEUI(row[euiIdx]) : "",
-      cota: cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null,
-      cable,
-      installer: installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "",
-      date: dateIdx !== -1 ? normalizeMuntatgeDateString(row[dateIdx]) : "",
-      acabat: acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "",
-      remesa: remesaIdx !== -1 ? String(row[remesaIdx] || "").trim() : "",
-    });
+    const eui = euiIdx !== -1 ? normEUI(row[euiIdx]) : "";
+    const cota = cotaIdx !== -1 ? parseFloat(String(row[cotaIdx] || "").replace(",", ".")) : null;
+    const installer = installerIdx !== -1 ? String(row[installerIdx] || "").trim() : "";
+    const date = dateIdx !== -1 ? normalizeMuntatgeDateString(row[dateIdx]) : "";
+    const acabat = acabatIdx !== -1 ? String(row[acabatIdx] || "").trim() : "";
+    const remesa = remesaIdx !== -1 ? String(row[remesaIdx] || "").trim() : "";
+    if (cable === null) {
+      // sense "Cable fins cota" vàlid -> no consta com a muntat, però es conserva per poder
+      // comprovar si comunica igualment quan es puja el fitxer de lectures
+      notMounted.push({ pozo: String(pozo), eui, cota, installer, date, acabat, remesa });
+      continue;
+    }
+    rows.push({ pozo: String(pozo), eui, cota, cable, installer, date, acabat, remesa });
   }
-  return rows;
+  return { rows, notMounted };
 }
 
 async function parseLastReadingByEui(file) {
@@ -473,6 +476,7 @@ function getIlla(pozoCode) {
 
 function MuntatgesView() {
   const [rows, setRows] = useState(null);
+  const [notMounted, setNotMounted] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
@@ -486,6 +490,7 @@ function MuntatgesView() {
   const [sortField, setSortField] = useState(null); // null | "muntatge" | "lectura"
   const [sortDir, setSortDir] = useState("desc"); // "desc" | "asc"
   const [collapsed, setCollapsed] = useState({});
+  const [showNotMounted, setShowNotMounted] = useState(false);
   const [visibleCols, setVisibleCols] = useState({ battery: true, errors: true, gpio: true, deviceInfo: true });
   const toggleCol = (key) => setVisibleCols((c) => ({ ...c, [key]: !c[key] }));
   const toggleHistory = (eui) => setExpandedHistory((c) => ({ ...c, [eui]: !c[eui] }));
@@ -495,8 +500,9 @@ function MuntatgesView() {
     setError(null);
     try {
       const wb = await fetchWorkbookFromUrl(ASSOC_CSV_URL);
-      const data = await parseMuntatgesFromWorkbook(wb);
+      const { rows: data, notMounted: nm } = await parseMuntatgesFromWorkbook(wb);
       setRows(data);
+      setNotMounted(nm);
     } catch (e) {
       setError(e.message || String(e));
     } finally {
@@ -595,6 +601,11 @@ function MuntatgesView() {
   }, [filteredRows, groupBy]);
 
   const pendents = useMemo(() => (rows || []).filter((r) => !parseMuntatgeDate(r.date)), [rows]);
+
+  const notMountedCommunicating = useMemo(() => {
+    if (!notMounted || !lastByEui) return [];
+    return notMounted.filter((r) => r.eui && lastByEui.has(r.eui));
+  }, [notMounted, lastByEui]);
   const toggle = (key) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
 
   const exportPdf = () => {
@@ -879,6 +890,47 @@ function MuntatgesView() {
               ))}
             </div>
           </>
+        )}
+
+        {notMountedCommunicating.length > 0 && (
+          <div style={styles.noSignalBox}>
+            <button style={styles.noSignalHeader} onClick={() => setShowNotMounted((s) => !s)}>
+              {showNotMounted ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+              <RadioTower size={15} color="#b03a3a" style={{ margin: "0 6px" }} />
+              {notMountedCommunicating.length} pous que comuniquen però NO consten com a muntats (sense "Cable fins cota" vàlid)
+            </button>
+            {showNotMounted && (
+              <div style={styles.tableWrap}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      <th style={styles.th}>Pou</th>
+                      <th style={styles.th}>DevEUI</th>
+                      <th style={styles.th}>Illa</th>
+                      <th style={styles.th}>Instal·lador</th>
+                      <th style={styles.th}>Cota</th>
+                      <th style={styles.th}>Última comunicació</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {notMountedCommunicating.map((r, i) => {
+                      const activity = lastByEui.get(r.eui);
+                      return (
+                        <tr key={i}>
+                          <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                          <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{r.eui.toUpperCase()}</td>
+                          <td style={styles.td}>{getIlla(r.pozo)}</td>
+                          <td style={styles.td}>{r.installer || "—"}</td>
+                          <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
+                          <td style={styles.td}>{activity.lastAny ? activity.lastAny.slice(0, 16).replace("T", " ") : "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         )}
       </div>
 
