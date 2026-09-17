@@ -2,14 +2,60 @@ import React, { useState, useMemo, useCallback, useEffect, useRef } from "react"
 import * as XLSX from "xlsx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, ChevronUp, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower } from "lucide-react";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+import { Upload, Droplets, AlertTriangle, Download, ChevronDown, ChevronRight, ChevronUp, Search, Waves, CheckCircle2, RefreshCw, Minimize2, Maximize2, FileSpreadsheet, RadioTower, Map as MapIcon } from "lucide-react";
 
 const BAR_TO_MH2O = 10.19716;
 const ASSOC_STORAGE_KEY = "pozos-assoc-v1";
 const ASSOC_CSV_URL =
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vQAi-_8-SD1mogQMDKb5j2kfl0xzJub5kXE1F0YTnkVV_qiBBjYFfTOTRsE-_ylRNcTxu9vKbswww2W/pub?gid=1661818251&single=true&output=csv";
+const COORDS_CSV_URL =
+  "https://docs.google.com/spreadsheets/d/e/2PACX-1vQAi-_8-SD1mogQMDKb5j2kfl0xzJub5kXE1F0YTnkVV_qiBBjYFfTOTRsE-_ylRNcTxu9vKbswww2W/pub?gid=392569350&single=true&output=csv";
 // DevEUI que no corresponen a pous reals i s'han d'ignorar sempre
 const IGNORED_EUIS = new Set(["24e124847f420841"]); // mesurador de cobertura
+
+function fixMangledCoord(raw, intDigits) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const dotCount = (s.match(/\./g) || []).length;
+  const commaCount = (s.match(/,/g) || []).length;
+  if (dotCount <= 1 && commaCount === 0) {
+    const v = parseFloat(s);
+    return Number.isNaN(v) ? null : v;
+  }
+  if (commaCount === 1 && dotCount === 0) {
+    const v = parseFloat(s.replace(",", "."));
+    return Number.isNaN(v) ? null : v;
+  }
+  // Google Sheets ha "maquillat" el número amb punts de milers (ex: "3.956.469.418")
+  const digits = s.replace(/[^\d]/g, "");
+  if (digits.length <= intDigits) return null;
+  const fixed = `${digits.slice(0, intDigits)}.${digits.slice(intDigits)}`;
+  const v = parseFloat(fixed);
+  return Number.isNaN(v) ? null : v;
+}
+
+async function parseCoordsFromWorkbook(wb) {
+  const sheet = findSheetWithHeader(wb, [/c[oó]digo\s*pozo/i, /latitud/i]);
+  if (!sheet) throw new Error('No encuentro columnas "Codigo pozo", "Latitud" i "Longitud" al full de coordenades.');
+  const pozoIdx = findCol(sheet.headers, [/c[oó]digo\s*pozo/i]);
+  const latIdx = findCol(sheet.headers, [/latitud/i]);
+  const lonIdx = findCol(sheet.headers, [/longitud/i]);
+  const coords = new Map();
+  for (let r = 1; r < sheet.rows.length; r++) {
+    const row = sheet.rows[r];
+    if (!row || !row.length) continue;
+    const pozo = pozoIdx !== -1 ? String(row[pozoIdx] || "").trim() : "";
+    if (!pozo) continue;
+    const lat = fixMangledCoord(row[latIdx], 2);
+    const lon = fixMangledCoord(row[lonIdx], 1);
+    if (lat === null || lon === null) continue;
+    coords.set(pozo, { lat, lon });
+  }
+  return coords;
+}
 
 function normEUI(s) {
   return String(s || "").replace(/[^0-9a-fA-F]/g, "").toLowerCase();
@@ -491,6 +537,9 @@ function MuntatgesView() {
   const [sortDir, setSortDir] = useState("desc"); // "desc" | "asc"
   const [collapsed, setCollapsed] = useState({});
   const [showNotMounted, setShowNotMounted] = useState(false);
+  const [showMap, setShowMap] = useState(false);
+  const [coordsByPozo, setCoordsByPozo] = useState(null);
+  const [coordsError, setCoordsError] = useState(null);
   const [visibleCols, setVisibleCols] = useState({ battery: true, errors: true, gpio: true, deviceInfo: true });
   const toggleCol = (key) => setVisibleCols((c) => ({ ...c, [key]: !c[key] }));
   const toggleHistory = (eui) => setExpandedHistory((c) => ({ ...c, [eui]: !c[eui] }));
@@ -508,6 +557,13 @@ function MuntatgesView() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    fetchWorkbookFromUrl(COORDS_CSV_URL)
+      .then(parseCoordsFromWorkbook)
+      .then(setCoordsByPozo)
+      .catch((e) => setCoordsError(e.message || String(e)));
   }, []);
 
   useEffect(() => {
@@ -704,6 +760,14 @@ function MuntatgesView() {
               onChange={(e) => setQuery(e.target.value)}
             />
           </div>
+          <button
+            style={{ ...styles.secondaryBtn, ...(showMap ? styles.segmentBtnActive : {}) }}
+            onClick={() => setShowMap((s) => !s)}
+            disabled={!coordsByPozo}
+          >
+            <MapIcon size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            {coordsByPozo ? (showMap ? "Amagar mapa" : "Veure mapa") : "Carregant mapa…"}
+          </button>
           <button style={styles.secondaryBtn} onClick={exportPdf} disabled={!rows || !rows.length}>
             <Download size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
             Descarregar PDF
@@ -713,6 +777,17 @@ function MuntatgesView() {
             {loading ? "Actualitzant…" : "Actualitzar ara"}
           </button>
         </div>
+
+        {coordsError && (
+          <div style={styles.errorBox}>
+            <AlertTriangle size={18} style={{ flexShrink: 0, marginTop: 2 }} />
+            <span>No s'ha pogut carregar el mapa de coordenades: {coordsError}</span>
+          </div>
+        )}
+
+        {showMap && coordsByPozo && rows && (
+          <PousMap rows={rows} coordsByPozo={coordsByPozo} lastByEui={lastByEui} query={query} />
+        )}
 
         {lastByEui && (
           <div style={styles.segmentGroup}>
@@ -1515,6 +1590,89 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
         }}
       />
     </label>
+  );
+}
+
+function PousMap({ rows, coordsByPozo, lastByEui, query }) {
+  const mapRef = useRef(null);
+  const mapInstance = useRef(null);
+  const markersLayer = useRef(null);
+
+  const q = (query || "").trim().toLowerCase();
+  const filtered = q ? rows.filter((r) => r.pozo.toLowerCase().includes(q)) : rows;
+
+  const points = filtered
+    .map((r) => {
+      const coord = coordsByPozo.get(r.pozo);
+      if (!coord) return null;
+      let status = "unknown"; // sense fitxer de lectures carregat
+      if (lastByEui) {
+        const activity = r.eui ? lastByEui.get(r.eui) : null;
+        status = activity && activity.lastReal ? "ok" : "sense";
+      }
+      return { pozo: r.pozo, lat: coord.lat, lon: coord.lon, status, installer: r.installer, date: r.date };
+    })
+    .filter(Boolean);
+
+  useEffect(() => {
+    if (!mapRef.current || mapInstance.current) return;
+    mapInstance.current = L.map(mapRef.current).setView([39.6, 2.9], 9);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      maxZoom: 19,
+    }).addTo(mapInstance.current);
+    markersLayer.current = L.layerGroup().addTo(mapInstance.current);
+    return () => {
+      mapInstance.current.remove();
+      mapInstance.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!mapInstance.current || !markersLayer.current) return;
+    markersLayer.current.clearLayers();
+    const colors = { ok: "#2a8f6c", sense: "#b03a3a", unknown: "#7c9490" };
+    const bounds = [];
+    points.forEach((p) => {
+      bounds.push([p.lat, p.lon]);
+      const marker = L.circleMarker([p.lat, p.lon], {
+        radius: 7,
+        color: "#fff",
+        weight: 1.5,
+        fillColor: colors[p.status],
+        fillOpacity: 0.9,
+      });
+      const statusLabel =
+        p.status === "ok" ? "Comunica" : p.status === "sense" ? "Sense lectures reals" : "Estat desconegut (puja el fitxer de lectures)";
+      marker.bindPopup(
+        `<strong>${p.pozo}</strong><br/>${statusLabel}${p.installer ? "<br/>Instal·lador: " + p.installer : ""}${
+          p.date ? "<br/>Muntatge: " + p.date : ""
+        }`
+      );
+      marker.addTo(markersLayer.current);
+    });
+    if (bounds.length) mapInstance.current.fitBounds(bounds, { padding: [30, 30] });
+  }, [points]);
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div ref={mapRef} style={{ height: 480, borderRadius: 10, border: "1px solid #e1ecea" }} />
+      <div style={{ display: "flex", gap: 16, marginTop: 8, fontSize: 12.5, color: "#4a615d", flexWrap: "wrap" }}>
+        <span>
+          <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: "#2a8f6c", marginRight: 5 }} />
+          Comunica
+        </span>
+        <span>
+          <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: "#b03a3a", marginRight: 5 }} />
+          Sense lectures reals
+        </span>
+        <span>
+          <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", background: "#7c9490", marginRight: 5 }} />
+          {lastByEui ? "Sense coordenades / no aplica" : "Puja el fitxer de lectures per veure l'estat"}
+        </span>
+        <span style={{ marginLeft: "auto" }}>{points.length} pous al mapa</span>
+      </div>
+    </div>
   );
 }
 
