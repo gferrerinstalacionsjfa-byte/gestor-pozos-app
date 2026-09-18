@@ -421,7 +421,27 @@ async function parseLastReadingByEui(file) {
     else if (!hasOk && hasErr) status = "error";
     else if (decoded) status = "info"; // bateria/GPIO/info dispositiu/ACK sense mesura ni error
     if (!historyByEui.has(eui)) historyByEui.set(eui, []);
-    historyByEui.get(eui).push({ ts, status, errors: decoded ? decoded.errors : [] });
+    historyByEui.get(eui).push({
+      ts,
+      status,
+      errors: decoded ? decoded.errors : [],
+      pressureBar: decoded ? decoded.pressureBar : undefined,
+      tempC: decoded ? decoded.tempC : undefined,
+      condMScm: decoded ? decoded.condMScm : undefined,
+    });
+    if (decoded && decoded.historical) {
+      for (const h of decoded.historical) {
+        if (h.pressureBar === undefined && h.tempC === undefined && h.condMScm === undefined) continue;
+        historyByEui.get(eui).push({
+          ts: h.timestamp.toISOString(),
+          status: "ok",
+          errors: [],
+          pressureBar: h.pressureBar,
+          tempC: h.tempC,
+          condMScm: h.condMScm,
+        });
+      }
+    }
 
     if (decoded) {
       const isReal = decoded.pressureBar !== undefined || decoded.tempC !== undefined || decoded.condMScm !== undefined;
@@ -950,7 +970,7 @@ function MuntatgesView() {
                                 {isExpanded && hist && (
                                   <tr>
                                     <td colSpan={20} style={{ ...styles.td, background: "#f7faf9" }}>
-                                      <ReadingHistorySummary history={hist} />
+                                      <ReadingHistorySummary history={hist} cable={r.cable} />
                                     </td>
                                   </tr>
                                 )}
@@ -985,20 +1005,44 @@ function MuntatgesView() {
                       <th style={styles.th}>Instal·lador</th>
                       <th style={styles.th}>Cota</th>
                       <th style={styles.th}>Última comunicació</th>
+                      <th style={styles.th}>Lectures</th>
                     </tr>
                   </thead>
                   <tbody>
                     {notMountedCommunicating.map((r, i) => {
                       const activity = lastByEui.get(r.eui);
+                      const hist = historyByEui && historyByEui.get(r.eui);
+                      const isOpen = expandedHistory[r.eui];
                       return (
-                        <tr key={i}>
-                          <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
-                          <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{r.eui.toUpperCase()}</td>
-                          <td style={styles.td}>{getIlla(r.pozo)}</td>
-                          <td style={styles.td}>{r.installer || "—"}</td>
-                          <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
-                          <td style={styles.td}>{activity.lastAny ? activity.lastAny.slice(0, 16).replace("T", " ") : "—"}</td>
-                        </tr>
+                        <React.Fragment key={i}>
+                          <tr>
+                            <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                            <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{r.eui.toUpperCase()}</td>
+                            <td style={styles.td}>{getIlla(r.pozo)}</td>
+                            <td style={styles.td}>{r.installer || "—"}</td>
+                            <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
+                            <td style={styles.td}>{activity.lastAny ? activity.lastAny.slice(0, 16).replace("T", " ") : "—"}</td>
+                            <td style={styles.td}>
+                              {hist && hist.length ? (
+                                <button style={styles.smallLinkBtn} onClick={() => toggleHistory(r.eui)}>
+                                  {isOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />} {hist.length} lectures
+                                </button>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
+                          </tr>
+                          {isOpen && hist && (
+                            <tr>
+                              <td colSpan={7} style={{ ...styles.td, background: "#fdf2f2" }}>
+                                <ReadingHistorySummary history={hist} cable={null} />
+                                <div style={{ fontSize: 11.5, color: "#a86a2d", marginTop: 4 }}>
+                                  Sense "Cable fins cota" vàlid no es pot calcular el nivell freàtic — es mostra la presió.
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
                       );
                     })}
                   </tbody>
@@ -1036,16 +1080,6 @@ function NivellApp() {
   const [results, setResults] = useState(null); // { groups, excluded, stats }
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState({});
-  const [showExcluded, setShowExcluded] = useState(false);
-  const [expandedExcluded, setExpandedExcluded] = useState({});
-  const toggleExpandedExcluded = (pozo) => setExpandedExcluded((c) => ({ ...c, [pozo]: !c[pozo] }));
-  const [showNoSignal, setShowNoSignal] = useState(false);
-  const noSignalRef = useRef(null);
-
-  const jumpToNoSignal = () => {
-    setShowNoSignal(true);
-    setTimeout(() => noSignalRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
-  };
 
   const syncFromSheet = useCallback(async ({ silent } = {}) => {
     if (!silent) setAssocLoading(true);
@@ -1143,8 +1177,6 @@ function NivellApp() {
       const rPayloadIdx = findCol(rHeaders, [/payload/i]);
 
       const groups = new Map(); // pozo -> date -> {pressures,temps,conds,nivels,count}
-      const excludedGroups = new Map(); // pozo -> date -> {pressures,temps,conds}
-      const excludedByEui = new Map(assocExcluded.map((x) => [x.eui, x]));
       const euisInFile = new Set();
       let totalReadings = 0;
       let matchedReadings = 0;
@@ -1158,24 +1190,7 @@ function NivellApp() {
         totalReadings++;
         euisInFile.add(eui);
         const info = assocMap.get(eui);
-        if (!info) {
-          const exclInfo = excludedByEui.get(eui);
-          if (exclInfo) {
-            const decodedExcl = decodePayload(row[rPayloadIdx]);
-            if (decodedExcl && decodedExcl.pressureBar !== undefined) {
-              const ts = row[rTsIdx];
-              const date = String(ts || "").slice(0, 10) || "sin-fecha";
-              if (!excludedGroups.has(exclInfo.pozo)) excludedGroups.set(exclInfo.pozo, new Map());
-              const byDate = excludedGroups.get(exclInfo.pozo);
-              if (!byDate.has(date)) byDate.set(date, { pressures: [], temps: [], conds: [] });
-              const bucket = byDate.get(date);
-              bucket.pressures.push(decodedExcl.pressureBar);
-              if (decodedExcl.tempC !== undefined) bucket.temps.push(decodedExcl.tempC);
-              if (decodedExcl.condMScm !== undefined) bucket.conds.push(decodedExcl.condMScm);
-            }
-          }
-          continue;
-        }
+        if (!info) continue;
         matchedReadings++;
         const decoded = decodePayload(row[rPayloadIdx]);
         if (!decoded || decoded.pressureBar === undefined) continue;
@@ -1227,25 +1242,9 @@ function NivellApp() {
         })
         .sort((a, b) => a.pozo.localeCompare(b.pozo));
 
-      const excludedReadingsByPozo = new Map();
-      for (const [pozo, byDate] of excludedGroups.entries()) {
-        const dates = Array.from(byDate.entries())
-          .map(([date, b]) => ({
-            date,
-            n: b.pressures.length,
-            pressureBar: avg(b.pressures),
-            pressureMH2O: avg(b.pressures) * BAR_TO_MH2O,
-            tempC: avg(b.temps),
-            condMScm: avg(b.conds),
-          }))
-          .sort((a, b) => (a.date < b.date ? 1 : -1));
-        excludedReadingsByPozo.set(pozo, dates);
-      }
-
       setResults({
         groups: groupList,
         excluded: [...assocExcluded].sort((a, b) => a.pozo.localeCompare(b.pozo)),
-        excludedReadingsByPozo,
         noSignal,
         stats: {
           totalReadings,
@@ -1429,8 +1428,6 @@ function NivellApp() {
           <>
             <div style={styles.statsRow}>
               <Stat label="Pous amb cota vàlida" value={results.stats.wellsOk} />
-              <Stat label="Pous exclosos" value={results.stats.wellsExcluded} warn />
-              <Stat label="Pous instal·lats sense senyal" value={results.stats.wellsNoSignal} warn onClick={results.stats.wellsNoSignal > 0 ? jumpToNoSignal : undefined} />
               <Stat label="Lectures totals" value={results.stats.totalReadings} />
               <Stat label="Lectures amb pou associat" value={results.stats.matchedReadings} />
               <Stat label="Lectures decodificades" value={results.stats.decodedReadings} />
@@ -1479,8 +1476,6 @@ function NivellApp() {
                     </span>
                   </button>
                   {!collapsed[g.pozo] && (
-                    <div>
-                      <NivellChart dates={g.dates} />
                     <div style={styles.tableWrap}>
                       <table style={styles.table}>
                         <thead>
@@ -1508,130 +1503,11 @@ function NivellApp() {
                           ))}
                         </tbody>
                       </table>
-                      </div>
                     </div>
                   )}
                 </div>
               ))}
             </div>
-
-            {results.noSignal.length > 0 && (
-              <div style={styles.noSignalBox} ref={noSignalRef}>
-                <button style={styles.noSignalHeader} onClick={() => setShowNoSignal((s) => !s)}>
-                  {showNoSignal ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                  <RadioTower size={15} color="#b03a3a" style={{ margin: "0 6px" }} />
-                  {results.noSignal.length} pous instal·lats (amb cota vàlida) que no han emès cap lectura en aquest fitxer
-                </button>
-                {showNoSignal && (
-                  <div style={styles.tableWrap}>
-                    <table style={styles.table}>
-                      <thead>
-                        <tr>
-                          <th style={styles.th}>Pou</th>
-                          <th style={styles.th}>DevEUI</th>
-                          <th style={styles.th}>Cota</th>
-                          <th style={styles.th}>Cable fins cota</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {results.noSignal.map((x, i) => (
-                          <tr key={i}>
-                            <td style={styles.td}>{x.pozo}</td>
-                            <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{x.eui}</td>
-                            <td style={styles.td}>{fmt(x.cota, 1)} m</td>
-                            <td style={styles.td}>{fmt(x.cable, 2)} m</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {results.excluded.length > 0 && (
-              <div style={styles.excludedBox}>
-                <button style={styles.excludedHeader} onClick={() => setShowExcluded((s) => !s)}>
-                  {showExcluded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                  <AlertTriangle size={15} color="#a86a2d" style={{ margin: "0 6px" }} />
-                  {results.excluded.length} pous exclosos per falta de "Cable fins cota" vàlid
-                </button>
-                {showExcluded && (
-                  <div style={styles.tableWrap}>
-                    <table style={styles.table}>
-                      <thead>
-                        <tr>
-                          <th style={styles.th}>Pou</th>
-                          <th style={styles.th}>DevEUI</th>
-                          <th style={styles.th}>Motiu</th>
-                          <th style={styles.th}>Lectures</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {results.excluded.map((x, i) => {
-                          const exclDates = results.excludedReadingsByPozo && results.excludedReadingsByPozo.get(x.pozo);
-                          const isOpen = expandedExcluded[x.pozo];
-                          return (
-                            <React.Fragment key={i}>
-                              <tr>
-                                <td style={styles.td}>{x.pozo}</td>
-                                <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{x.eui}</td>
-                                <td style={styles.td}>{x.motivo}</td>
-                                <td style={styles.td}>
-                                  {exclDates && exclDates.length ? (
-                                    <button style={styles.smallLinkBtn} onClick={() => toggleExpandedExcluded(x.pozo)}>
-                                      {isOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />} {exclDates.length} dies
-                                    </button>
-                                  ) : (
-                                    "—"
-                                  )}
-                                </td>
-                              </tr>
-                              {isOpen && exclDates && (
-                                <tr>
-                                  <td colSpan={4} style={{ ...styles.td, background: "#fffaf3" }}>
-                                    <div style={styles.tableWrap}>
-                                      <table style={styles.table}>
-                                        <thead>
-                                          <tr>
-                                            <th style={styles.th}>Data</th>
-                                            <th style={styles.th}>Lectures</th>
-                                            <th style={styles.th}>Pressió (bar)</th>
-                                            <th style={styles.th}>Pressió (mH2O)</th>
-                                            <th style={styles.th}>Temp. (°C)</th>
-                                            <th style={styles.th}>Conductivitat (mS/cm)</th>
-                                          </tr>
-                                        </thead>
-                                        <tbody>
-                                          {exclDates.map((d) => (
-                                            <tr key={d.date}>
-                                              <td style={styles.td}>{d.date}</td>
-                                              <td style={styles.td}>{d.n}</td>
-                                              <td style={styles.td}>{fmt(d.pressureBar, 4)}</td>
-                                              <td style={styles.td}>{fmt(d.pressureMH2O, 3)}</td>
-                                              <td style={styles.td}>{fmt(d.tempC, 2)}</td>
-                                              <td style={styles.td}>{d.condMScm !== null ? fmt(d.condMScm, 3) : "—"}</td>
-                                            </tr>
-                                          ))}
-                                        </tbody>
-                                      </table>
-                                    </div>
-                                    <div style={{ fontSize: 11.5, color: "#a86a2d", marginTop: 6 }}>
-                                      Sense "Cable fins cota" vàlid no es pot calcular el nivell freàtic — només es mostra la
-                                      presió, temperatura i conductivitat.
-                                    </div>
-                                  </td>
-                                </tr>
-                              )}
-                            </React.Fragment>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
-            )}
           </>
         )}
       </div>
@@ -1685,7 +1561,7 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
   );
 }
 
-function NivellChart({ dates }) {
+function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m", decimals = 3 }) {
   const points = [...dates].filter((d) => d.nivel !== null && !Number.isNaN(d.nivel)).sort((a, b) => (a.date < b.date ? -1 : 1));
   if (points.length < 2) return null;
 
@@ -1737,12 +1613,12 @@ function NivellChart({ dates }) {
         {points.map((p, i) => (
           <circle key={i} cx={x(i)} cy={y(p.nivel)} r="3" fill="#1f5e59">
             <title>
-              {p.date}: {p.nivel.toFixed(3)} m
+              {p.date}: {p.nivel.toFixed(decimals)} {unit}
             </title>
           </circle>
         ))}
       </svg>
-      <div style={{ fontSize: 11, color: "#9fb3ae", marginBottom: 4 }}>Nivell freàtic (m) per dia</div>
+      <div style={{ fontSize: 11, color: "#9fb3ae", marginBottom: 4 }}>{label}</div>
     </div>
   );
 }
@@ -1830,11 +1706,25 @@ function PousMap({ rows, coordsByPozo, lastByEui, query }) {
   );
 }
 
-function ReadingHistorySummary({ history }) {
+function ReadingHistorySummary({ history, cable }) {
   const counts = { ok: 0, parcial: 0, error: 0, info: 0, sense_dades: 0 };
   history.forEach((h) => counts[h.status]++);
   const total = history.length;
   const pct = (n) => (total ? Math.round((n / total) * 100) : 0);
+
+  const byDate = new Map();
+  history.forEach((h) => {
+    if (h.pressureBar === undefined) return;
+    const date = h.ts.slice(0, 10);
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push(h.pressureBar);
+  });
+  const hasCable = cable !== null && cable !== undefined && !Number.isNaN(cable);
+  const chartDates = Array.from(byDate.entries()).map(([date, pressures]) => {
+    const avgP = pressures.reduce((a, b) => a + b, 0) / pressures.length;
+    const value = hasCable ? cable - avgP * BAR_TO_MH2O : avgP;
+    return { date, nivel: value };
+  });
 
   return (
     <div style={{ padding: "8px 4px" }}>
@@ -1863,7 +1753,13 @@ function ReadingHistorySummary({ history }) {
           </span>
         )}
       </div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 2, maxWidth: "100%" }}>
+      <NivellChart
+        dates={chartDates}
+        label={hasCable ? "Nivell freàtic (m) per dia" : "Pressió (bar) per dia — sense cable fins cota per calcular el nivell"}
+        unit={hasCable ? "m" : "bar"}
+        decimals={hasCable ? 3 : 4}
+      />
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 2, maxWidth: "100%", marginTop: 8 }}>
         {history.map((h, i) => (
           <div
             key={i}
