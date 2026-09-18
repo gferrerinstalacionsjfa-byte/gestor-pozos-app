@@ -1037,6 +1037,8 @@ function NivellApp() {
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState({});
   const [showExcluded, setShowExcluded] = useState(false);
+  const [expandedExcluded, setExpandedExcluded] = useState({});
+  const toggleExpandedExcluded = (pozo) => setExpandedExcluded((c) => ({ ...c, [pozo]: !c[pozo] }));
   const [showNoSignal, setShowNoSignal] = useState(false);
   const noSignalRef = useRef(null);
 
@@ -1141,6 +1143,8 @@ function NivellApp() {
       const rPayloadIdx = findCol(rHeaders, [/payload/i]);
 
       const groups = new Map(); // pozo -> date -> {pressures,temps,conds,nivels,count}
+      const excludedGroups = new Map(); // pozo -> date -> {pressures,temps,conds}
+      const excludedByEui = new Map(assocExcluded.map((x) => [x.eui, x]));
       const euisInFile = new Set();
       let totalReadings = 0;
       let matchedReadings = 0;
@@ -1154,7 +1158,24 @@ function NivellApp() {
         totalReadings++;
         euisInFile.add(eui);
         const info = assocMap.get(eui);
-        if (!info) continue;
+        if (!info) {
+          const exclInfo = excludedByEui.get(eui);
+          if (exclInfo) {
+            const decodedExcl = decodePayload(row[rPayloadIdx]);
+            if (decodedExcl && decodedExcl.pressureBar !== undefined) {
+              const ts = row[rTsIdx];
+              const date = String(ts || "").slice(0, 10) || "sin-fecha";
+              if (!excludedGroups.has(exclInfo.pozo)) excludedGroups.set(exclInfo.pozo, new Map());
+              const byDate = excludedGroups.get(exclInfo.pozo);
+              if (!byDate.has(date)) byDate.set(date, { pressures: [], temps: [], conds: [] });
+              const bucket = byDate.get(date);
+              bucket.pressures.push(decodedExcl.pressureBar);
+              if (decodedExcl.tempC !== undefined) bucket.temps.push(decodedExcl.tempC);
+              if (decodedExcl.condMScm !== undefined) bucket.conds.push(decodedExcl.condMScm);
+            }
+          }
+          continue;
+        }
         matchedReadings++;
         const decoded = decodePayload(row[rPayloadIdx]);
         if (!decoded || decoded.pressureBar === undefined) continue;
@@ -1206,9 +1227,25 @@ function NivellApp() {
         })
         .sort((a, b) => a.pozo.localeCompare(b.pozo));
 
+      const excludedReadingsByPozo = new Map();
+      for (const [pozo, byDate] of excludedGroups.entries()) {
+        const dates = Array.from(byDate.entries())
+          .map(([date, b]) => ({
+            date,
+            n: b.pressures.length,
+            pressureBar: avg(b.pressures),
+            pressureMH2O: avg(b.pressures) * BAR_TO_MH2O,
+            tempC: avg(b.temps),
+            condMScm: avg(b.conds),
+          }))
+          .sort((a, b) => (a.date < b.date ? 1 : -1));
+        excludedReadingsByPozo.set(pozo, dates);
+      }
+
       setResults({
         groups: groupList,
         excluded: [...assocExcluded].sort((a, b) => a.pozo.localeCompare(b.pozo)),
+        excludedReadingsByPozo,
         noSignal,
         stats: {
           totalReadings,
@@ -1442,6 +1479,8 @@ function NivellApp() {
                     </span>
                   </button>
                   {!collapsed[g.pozo] && (
+                    <div>
+                      <NivellChart dates={g.dates} />
                     <div style={styles.tableWrap}>
                       <table style={styles.table}>
                         <thead>
@@ -1469,6 +1508,7 @@ function NivellApp() {
                           ))}
                         </tbody>
                       </table>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -1524,16 +1564,68 @@ function NivellApp() {
                           <th style={styles.th}>Pou</th>
                           <th style={styles.th}>DevEUI</th>
                           <th style={styles.th}>Motiu</th>
+                          <th style={styles.th}>Lectures</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {results.excluded.map((x, i) => (
-                          <tr key={i}>
-                            <td style={styles.td}>{x.pozo}</td>
-                            <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{x.eui}</td>
-                            <td style={styles.td}>{x.motivo}</td>
-                          </tr>
-                        ))}
+                        {results.excluded.map((x, i) => {
+                          const exclDates = results.excludedReadingsByPozo && results.excludedReadingsByPozo.get(x.pozo);
+                          const isOpen = expandedExcluded[x.pozo];
+                          return (
+                            <React.Fragment key={i}>
+                              <tr>
+                                <td style={styles.td}>{x.pozo}</td>
+                                <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{x.eui}</td>
+                                <td style={styles.td}>{x.motivo}</td>
+                                <td style={styles.td}>
+                                  {exclDates && exclDates.length ? (
+                                    <button style={styles.smallLinkBtn} onClick={() => toggleExpandedExcluded(x.pozo)}>
+                                      {isOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />} {exclDates.length} dies
+                                    </button>
+                                  ) : (
+                                    "—"
+                                  )}
+                                </td>
+                              </tr>
+                              {isOpen && exclDates && (
+                                <tr>
+                                  <td colSpan={4} style={{ ...styles.td, background: "#fffaf3" }}>
+                                    <div style={styles.tableWrap}>
+                                      <table style={styles.table}>
+                                        <thead>
+                                          <tr>
+                                            <th style={styles.th}>Data</th>
+                                            <th style={styles.th}>Lectures</th>
+                                            <th style={styles.th}>Pressió (bar)</th>
+                                            <th style={styles.th}>Pressió (mH2O)</th>
+                                            <th style={styles.th}>Temp. (°C)</th>
+                                            <th style={styles.th}>Conductivitat (mS/cm)</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {exclDates.map((d) => (
+                                            <tr key={d.date}>
+                                              <td style={styles.td}>{d.date}</td>
+                                              <td style={styles.td}>{d.n}</td>
+                                              <td style={styles.td}>{fmt(d.pressureBar, 4)}</td>
+                                              <td style={styles.td}>{fmt(d.pressureMH2O, 3)}</td>
+                                              <td style={styles.td}>{fmt(d.tempC, 2)}</td>
+                                              <td style={styles.td}>{d.condMScm !== null ? fmt(d.condMScm, 3) : "—"}</td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                    <div style={{ fontSize: 11.5, color: "#a86a2d", marginTop: 6 }}>
+                                      Sense "Cable fins cota" vàlid no es pot calcular el nivell freàtic — només es mostra la
+                                      presió, temperatura i conductivitat.
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -1590,6 +1682,68 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
         }}
       />
     </label>
+  );
+}
+
+function NivellChart({ dates }) {
+  const points = [...dates].filter((d) => d.nivel !== null && !Number.isNaN(d.nivel)).sort((a, b) => (a.date < b.date ? -1 : 1));
+  if (points.length < 2) return null;
+
+  const W = 720;
+  const H = 160;
+  const padL = 52;
+  const padR = 16;
+  const padT = 14;
+  const padB = 28;
+  const values = points.map((p) => p.nivel);
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) {
+    min -= 0.5;
+    max += 0.5;
+  }
+  const pad = (max - min) * 0.08;
+  min -= pad;
+  max += pad;
+
+  const x = (i) => padL + (i / (points.length - 1)) * (W - padL - padR);
+  const y = (v) => padT + (1 - (v - min) / (max - min)) * (H - padT - padB);
+
+  const path = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.nivel).toFixed(1)}`).join(" ");
+  const ticksY = 4;
+  const yTickVals = Array.from({ length: ticksY + 1 }, (_, i) => min + ((max - min) * i) / ticksY);
+  const xLabelEvery = Math.max(1, Math.ceil(points.length / 6));
+
+  return (
+    <div style={{ padding: "14px 18px 4px", background: "#fff" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+        {yTickVals.map((v, i) => (
+          <g key={i}>
+            <line x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#eef4f3" strokeWidth="1" />
+            <text x={padL - 8} y={y(v) + 4} textAnchor="end" fontSize="10" fill="#7c9490">
+              {v.toFixed(2)}
+            </text>
+          </g>
+        ))}
+        {points.map(
+          (p, i) =>
+            i % xLabelEvery === 0 && (
+              <text key={i} x={x(i)} y={H - 8} textAnchor="middle" fontSize="9.5" fill="#7c9490">
+                {p.date.slice(5)}
+              </text>
+            )
+        )}
+        <path d={path} fill="none" stroke="#1f5e59" strokeWidth="2" />
+        {points.map((p, i) => (
+          <circle key={i} cx={x(i)} cy={y(p.nivel)} r="3" fill="#1f5e59">
+            <title>
+              {p.date}: {p.nivel.toFixed(3)} m
+            </title>
+          </circle>
+        ))}
+      </svg>
+      <div style={{ fontSize: 11, color: "#9fb3ae", marginBottom: 4 }}>Nivell freàtic (m) per dia</div>
+    </div>
   );
 }
 
