@@ -689,6 +689,29 @@ function MuntatgesView() {
     if (!notMounted || !lastByEui) return [];
     return notMounted.filter((r) => r.eui && lastByEui.has(r.eui));
   }, [notMounted, lastByEui]);
+
+  const notMountedGroups = useMemo(() => {
+    if (groupBy === "none") {
+      return [{ key: "__all__", label: "Tots els pous", wells: notMountedCommunicating }];
+    }
+    const byKey = new Map();
+    for (const r of notMountedCommunicating) {
+      const key =
+        groupBy === "illa"
+          ? getIlla(r.pozo)
+          : groupBy === "vigilant"
+          ? r.vigilant || "Sense vigilant assignat"
+          : r.installer || "Sense instal·lador assignat";
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(r);
+    }
+    return Array.from(byKey.entries())
+      .map(([key, wells]) => ({ key, label: key, wells }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [notMountedCommunicating, groupBy]);
+  const [collapsedNotMounted, setCollapsedNotMounted] = useState({});
+  const toggleNotMounted = (key) => setCollapsedNotMounted((c) => ({ ...c, [key]: !c[key] }));
+
   const toggle = (key) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
 
   const exportPdf = () => {
@@ -1018,58 +1041,76 @@ function MuntatgesView() {
               {notMountedCommunicating.length} pous que comuniquen però NO consten com a muntats (sense "Cable fins cota" vàlid)
             </button>
             {showNotMounted && (
-              <div style={styles.tableWrap}>
-                <table style={styles.table}>
-                  <thead>
-                    <tr>
-                      <th style={styles.th}>Pou</th>
-                      <th style={styles.th}>DevEUI</th>
-                      <th style={styles.th}>Illa</th>
-                      <th style={styles.th}>Instal·lador</th>
-                      <th style={styles.th}>Cota</th>
-                      <th style={styles.th}>Última comunicació</th>
-                      <th style={styles.th}>Lectures</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {notMountedCommunicating.map((r, i) => {
-                      const activity = lastByEui.get(r.eui);
-                      const hist = historyByEui && historyByEui.get(r.eui);
-                      const isOpen = expandedHistory[r.eui];
-                      return (
-                        <React.Fragment key={i}>
-                          <tr>
-                            <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
-                            <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{r.eui.toUpperCase()}</td>
-                            <td style={styles.td}>{getIlla(r.pozo)}</td>
-                            <td style={styles.td}>{r.installer || "—"}</td>
-                            <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
-                            <td style={styles.td}>{activity.lastAny ? activity.lastAny.slice(0, 16).replace("T", " ") : "—"}</td>
-                            <td style={styles.td}>
-                              {hist && hist.length ? (
-                                <button style={styles.smallLinkBtn} onClick={() => toggleHistory(r.eui)}>
-                                  {isOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />} {hist.length} lectures
-                                </button>
-                              ) : (
-                                "—"
-                              )}
-                            </td>
-                          </tr>
-                          {isOpen && hist && (
+              <div style={{ padding: "0 14px 14px" }}>
+                {notMountedGroups.map((g) => (
+                  <div key={g.key} style={{ ...styles.groupCard, marginTop: 10 }}>
+                    {groupBy !== "none" && (
+                      <button style={styles.groupHeader} onClick={() => toggleNotMounted(g.key)}>
+                        {collapsedNotMounted[g.key] ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+                        <RadioTower size={15} color="#b03a3a" style={{ marginRight: 6 }} />
+                        <span style={styles.groupTitle}>{g.label}</span>
+                        <span style={styles.groupMeta}>{g.wells.length} pous</span>
+                      </button>
+                    )}
+                    {(groupBy === "none" || !collapsedNotMounted[g.key]) && (
+                      <div style={styles.tableWrap}>
+                        <table style={styles.table}>
+                          <thead>
                             <tr>
-                              <td colSpan={7} style={{ ...styles.td, background: "#fdf2f2" }}>
-                                <ReadingHistorySummary history={hist} cable={null} />
-                                <div style={{ fontSize: 11.5, color: "#a86a2d", marginTop: 4 }}>
-                                  Sense "Cable fins cota" vàlid no es pot calcular el nivell freàtic — es mostra la presió.
-                                </div>
-                              </td>
+                              <th style={styles.th}>Pou</th>
+                              <th style={styles.th}>DevEUI</th>
+                              {groupBy !== "illa" && <th style={styles.th}>Illa</th>}
+                              {groupBy !== "installer" && <th style={styles.th}>Instal·lador</th>}
+                              {groupBy !== "vigilant" && <th style={styles.th}>Vigilant</th>}
+                              <th style={styles.th}>Cota</th>
+                              <th style={styles.th}>Última comunicació</th>
+                              <th style={styles.th}>Lectures</th>
                             </tr>
-                          )}
-                        </React.Fragment>
-                      );
-                    })}
-                  </tbody>
-                </table>
+                          </thead>
+                          <tbody>
+                            {g.wells.map((r, i) => {
+                              const activity = lastByEui.get(r.eui);
+                              const hist = historyByEui && historyByEui.get(r.eui);
+                              const isOpen = expandedHistory[r.eui];
+                              return (
+                                <React.Fragment key={i}>
+                                  <tr>
+                                    <td style={{ ...styles.td, fontWeight: 600 }}>{r.pozo}</td>
+                                    <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{r.eui.toUpperCase()}</td>
+                                    {groupBy !== "illa" && <td style={styles.td}>{getIlla(r.pozo)}</td>}
+                                    {groupBy !== "installer" && <td style={styles.td}>{r.installer || "—"}</td>}
+                                    {groupBy !== "vigilant" && <td style={styles.td}>{r.vigilant || "—"}</td>}
+                                    <td style={styles.td}>{r.cota !== null && !Number.isNaN(r.cota) ? fmt(r.cota, 1) + " m" : "—"}</td>
+                                    <td style={styles.td}>{activity.lastAny ? activity.lastAny.slice(0, 16).replace("T", " ") : "—"}</td>
+                                    <td style={styles.td}>
+                                      {hist && hist.length ? (
+                                        <button style={styles.smallLinkBtn} onClick={() => toggleHistory(r.eui)}>
+                                          {isOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />} {hist.length} lectures
+                                        </button>
+                                      ) : (
+                                        "—"
+                                      )}
+                                    </td>
+                                  </tr>
+                                  {isOpen && hist && (
+                                    <tr>
+                                      <td colSpan={8} style={{ ...styles.td, background: "#fdf2f2" }}>
+                                        <ReadingHistorySummary history={hist} cable={null} />
+                                        <div style={{ fontSize: 11.5, color: "#a86a2d", marginTop: 4 }}>
+                                          Sense "Cable fins cota" vàlid no es pot calcular el nivell freàtic — es mostra la presió.
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  )}
+                                </React.Fragment>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                ))}
               </div>
             )}
           </div>
