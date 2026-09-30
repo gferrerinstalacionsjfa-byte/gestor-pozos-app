@@ -931,7 +931,7 @@ function MuntatgesView() {
         <span style={styles.brandSub}>Data de muntatge i instal·lador, pous amb cable fins cota mesurat</span>
       </div>
 
-      <div style={styles.container}>
+      <div style={styles.containerWide}>
         {readingsMeta && !readingsFile ? (
           <div style={styles.assocLoadedCard}>
             <CheckCircle2 size={20} color="#2a8f6c" />
@@ -2052,6 +2052,7 @@ const styles = {
   brandText: { color: "#e8f3f2", fontSize: 20, fontWeight: 700, letterSpacing: 0.3 },
   brandSub: { color: "#9fc4c0", fontSize: 13 },
   container: { maxWidth: 1100, margin: "0 auto", padding: "24px 20px 60px" },
+  containerWide: { maxWidth: "100%", margin: "0 auto", padding: "24px 28px 60px" },
   uploadRow: { display: "flex", gap: 16, flexWrap: "wrap" },
   uploadCard: {
     flex: "1 1 320px",
