@@ -327,6 +327,41 @@ function saveAssocToStorage(data) {
   }
 }
 
+const READINGS_STORAGE_KEY = "pozos-muntatges-readings-v1";
+
+function loadReadingsFromStorage() {
+  try {
+    const raw = localStorage.getItem(READINGS_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return {
+      lastByEui: new Map(parsed.lastByEui),
+      historyByEui: new Map(parsed.historyByEui),
+      fileName: parsed.fileName,
+      savedAt: parsed.savedAt,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveReadingsToStorage(data) {
+  try {
+    localStorage.setItem(
+      READINGS_STORAGE_KEY,
+      JSON.stringify({
+        lastByEui: Array.from(data.lastByEui.entries()),
+        historyByEui: Array.from(data.historyByEui.entries()),
+        fileName: data.fileName,
+        savedAt: data.savedAt,
+      })
+    );
+    return true;
+  } catch (e) {
+    return false; // p.ej. fitxer massa gran o no disponible en la vista prèvia de Claude.ai
+  }
+}
+
 async function parseMuntatgesFromWorkbook(assocWb) {
   const sheet = findSheetWithHeader(assocWb, [/c[oó]digo\s*pozo/i, /data\s*de\s*muntatge/i]);
   if (!sheet) {
@@ -559,6 +594,7 @@ function MuntatgesView() {
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
   const [readingsFile, setReadingsFile] = useState(null);
+  const [readingsMeta, setReadingsMeta] = useState(null); // { fileName, savedAt, persisted }
   const [lastByEui, setLastByEui] = useState(null);
   const [historyByEui, setHistoryByEui] = useState(null);
   const [expandedHistory, setExpandedHistory] = useState({});
@@ -623,6 +659,15 @@ function MuntatgesView() {
   }, []);
 
   useEffect(() => {
+    const saved = loadReadingsFromStorage();
+    if (saved) {
+      setLastByEui(saved.lastByEui);
+      setHistoryByEui(saved.historyByEui);
+      setReadingsMeta({ fileName: saved.fileName, savedAt: saved.savedAt, persisted: true });
+    }
+  }, []);
+
+  useEffect(() => {
     load();
   }, [load]);
 
@@ -637,12 +682,26 @@ function MuntatgesView() {
       const { lastByEui: lm, historyByEui: hm } = await parseLastReadingByEui(file);
       setLastByEui(lm);
       setHistoryByEui(hm);
+      const meta = { fileName: file.name, savedAt: new Date().toISOString() };
+      const persisted = saveReadingsToStorage({ lastByEui: lm, historyByEui: hm, ...meta });
+      setReadingsMeta({ ...meta, persisted });
     } catch (e) {
       setReadingsError(e.message || String(e));
     } finally {
       setReadingsLoading(false);
     }
   }, []);
+
+  const clearReadingsFile = () => {
+    try {
+      localStorage.removeItem(READINGS_STORAGE_KEY);
+    } catch (e) {}
+    setReadingsFile(null);
+    setReadingsMeta(null);
+    setLastByEui(null);
+    setHistoryByEui(null);
+    setExpandedHistory({});
+  };
 
   // si es queda sense fitxer de lectures mentre s'ordenava per última lectura, es treu l'ordre
   useEffect(() => {
@@ -873,22 +932,55 @@ function MuntatgesView() {
       </div>
 
       <div style={styles.container}>
-        <UploadCard
-          label="Fitxer de lectures (opcional)"
-          hint="Puja l'export de lectures per veure l'última comunicació real de cada pou — arrossega'l aquí o fes clic"
-          file={readingsFile}
-          onFile={handleReadingsFile}
-          inputId="muntatges-readings-input"
-          extra={
-            readingsError ? (
-              <span style={{ color: "#a86a2d" }}>{readingsError}</span>
-            ) : readingsLoading ? (
-              <span>Analitzant…</span>
-            ) : lastByEui ? (
-              <span style={{ color: "#2a8f6c", fontWeight: 600 }}>{lastByEui.size} DevEUI amb activitat al fitxer</span>
-            ) : null
-          }
-        />
+        {readingsMeta && !readingsFile ? (
+          <div style={styles.assocLoadedCard}>
+            <CheckCircle2 size={20} color="#2a8f6c" />
+            <div style={{ flex: 1 }}>
+              <div style={styles.uploadLabel}>Fitxer de lectures desat</div>
+              <div style={styles.uploadHint}>
+                {readingsMeta.fileName} · desat el {new Date(readingsMeta.savedAt).toLocaleString("es-ES")}
+                {!readingsMeta.persisted && " · no s'ha pogut desar per a la propera visita"}
+                {lastByEui && ` · ${lastByEui.size} DevEUI amb activitat`}
+              </div>
+            </div>
+            <label htmlFor="muntatges-readings-input" style={styles.smallLinkBtn}>
+              <RefreshCw size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+              Canviar
+            </label>
+            <input
+              id="muntatges-readings-input"
+              type="file"
+              accept=".xlsx,.xls"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleReadingsFile(f);
+              }}
+            />
+          </div>
+        ) : (
+          <UploadCard
+            label="Fitxer de lectures (opcional)"
+            hint="Puja l'export de lectures per veure l'última comunicació real de cada pou — arrossega'l aquí o fes clic"
+            file={readingsFile}
+            onFile={handleReadingsFile}
+            inputId="muntatges-readings-input"
+            extra={
+              readingsError ? (
+                <span style={{ color: "#a86a2d" }}>{readingsError}</span>
+              ) : readingsLoading ? (
+                <span>Analitzant…</span>
+              ) : lastByEui ? (
+                <span style={{ color: "#2a8f6c", fontWeight: 600 }}>{lastByEui.size} DevEUI amb activitat al fitxer</span>
+              ) : null
+            }
+          />
+        )}
+        {readingsMeta && (
+          <button style={styles.tinyClearBtn} onClick={clearReadingsFile}>
+            Eliminar fitxer de lectures desat
+          </button>
+        )}
 
         <div style={styles.searchRow}>
           <div style={styles.searchBar}>
