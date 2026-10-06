@@ -261,7 +261,7 @@ function parseAssociationFromWorkbook(assocWb) {
   }
   const aHeaders = assocSheet.headers;
   const euiIdx = findCol(aHeaders, [/dev\s*eui/i, /device_eui/i]);
-  const pozoIdx = findCol(aHeaders, [/c[oó]digo\s*pozo/i, /^codi$/i]);
+  const pozoIdx = findCol(aHeaders, [/^codi$/i, /c[oó]digo\s*pozo/i]); // CODI té prioritat
   const cotaIdx = findCol(aHeaders, [/^cota$/i]);
   const cableIdx = findCol(aHeaders, [/cable\s*fins\s*cota/i]);
 
@@ -363,12 +363,12 @@ function saveReadingsToStorage(data) {
 }
 
 async function parseMuntatgesFromWorkbook(assocWb) {
-  const sheet = findSheetWithHeader(assocWb, [/c[oó]digo\s*pozo/i, /data\s*de\s*muntatge/i]);
+  const sheet = findSheetWithHeader(assocWb, [/data\s*de\s*muntatge/i, /dev\s*eui/i]);
   if (!sheet) {
     throw new Error('No encuentro una hoja con columnas "Código pozo" y "Data de muntatge".');
   }
   const headers = sheet.headers;
-  const pozoIdx = findCol(headers, [/c[oó]digo\s*pozo/i, /^codi$/i]);
+  const pozoIdx = findCol(headers, [/^codi$/i, /c[oó]digo\s*pozo/i]); // CODI té prioritat
   const euiIdx = findCol(headers, [/dev\s*eui/i]);
   const cotaIdx = findCol(headers, [/^cota$/i]);
   const cableIdx = findCol(headers, [/cable\s*fins\s*cota/i]);
