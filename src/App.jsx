@@ -77,6 +77,18 @@ function findCol(headers, patterns) {
   return -1;
 }
 
+// Pous amb 3 sondes CTD (Modbus Slave ID 1, 2, 3): dolça, interfase, salada.
+// Canals UC502 de cada sonda. La sonda 1 usa els canals de sempre (7/8/9).
+// Si en una lectura real els canals de les sondes 2 i 3 fossin uns altres, només cal canviar-los aquí.
+const PROBE_CHANNELS = [
+  { name: "dolça", p: 7, t: 8, c: 9 },
+  { name: "interfase", p: 10, t: 11, c: 12 },
+  { name: "salada", p: 13, t: 14, c: 15 },
+];
+// Verificat amb una lectura real d'un pou de 3 sondes: canals 7-9, 10-12 i 13-15.
+// Pous normals (1 sonda): només canals 7, 8 i 9. Els de 3 sondes es detecten pels canals 10-15.
+const PROBE_COLORS = ["#2a8f6c", "#c98a2d", "#b03a3a"];
+
 function decodePayload(hex) {
   if (!hex || typeof hex !== "string") return null;
   const clean = hex.replace(/\s/g, "").toUpperCase();
@@ -102,7 +114,7 @@ function decodePayload(hex) {
     return bytes[offset] | (bytes[offset + 1] << 8);
   };
 
-  const out = { errors: [], deviceInfo: null, ack: null, historical: [] };
+  const out = { errors: [], deviceInfo: null, ack: null, historical: [], probes: {} };
 
   // --- Comandos / ACK (comença per FE) ---
   if (bytes[0] === 0xfe) {
@@ -127,26 +139,48 @@ function decodePayload(hex) {
   }
 
   // --- Errors RS485/Modbus i lectures en viu (FF0E = dada, FF15 = error) ---
+  const chVals = {};
+  const chErrs = new Set();
   for (let i = 0; i + 3 <= len; i++) {
     if (bytes[i] === 0xff && (bytes[i + 1] === 0x0e || bytes[i + 1] === 0x15)) {
       const channel = bytes[i + 2];
       if (bytes[i + 1] === 0x15) {
-        if (channel === 7) out.errors.push("presió");
-        else if (channel === 8) out.errors.push("temperatura");
-        else if (channel === 9) out.errors.push("conductivitat");
+        chErrs.add(channel);
         i += 2;
         continue;
       }
       if (bytes[i + 3] === 0x25) {
         const val = readFloat32LE(i + 4);
-        if (val !== null) {
-          if (channel === 7) out.pressureBar = val;
-          else if (channel === 8) out.tempC = val;
-          else if (channel === 9) out.condMScm = val;
-        }
+        if (val !== null) chVals[channel] = val;
         i += 7;
       }
     }
+  }
+  const isMulti = [...Object.keys(chVals).map(Number), ...chErrs].some((c) => c >= 10 && c <= 15);
+  if (isMulti) {
+    PROBE_CHANNELS.forEach((pc, k) => {
+      const slot = {};
+      if (chVals[pc.p] !== undefined) slot.pressureBar = chVals[pc.p];
+      if (chVals[pc.t] !== undefined) slot.tempC = chVals[pc.t];
+      if (chVals[pc.c] !== undefined) slot.condMScm = chVals[pc.c];
+      if (Object.keys(slot).length) out.probes[k] = slot;
+      if (chErrs.has(pc.p)) out.errors.push(`presió sonda ${pc.name}`);
+      if (chErrs.has(pc.t)) out.errors.push(`temperatura sonda ${pc.name}`);
+      if (chErrs.has(pc.c)) out.errors.push(`conductivitat sonda ${pc.name}`);
+    });
+    // el nivell i la resta de columnes usen la sonda 1 (dolça)
+    if (out.probes[0]) {
+      out.pressureBar = out.probes[0].pressureBar;
+      out.tempC = out.probes[0].tempC;
+      out.condMScm = out.probes[0].condMScm;
+    }
+  } else {
+    if (chVals[7] !== undefined) out.pressureBar = chVals[7];
+    if (chVals[8] !== undefined) out.tempC = chVals[8];
+    if (chVals[9] !== undefined) out.condMScm = chVals[9];
+    if (chErrs.has(7)) out.errors.push("presió");
+    if (chErrs.has(8)) out.errors.push("temperatura");
+    if (chErrs.has(9)) out.errors.push("conductivitat");
   }
 
   // --- Informació del dispositiu ---
@@ -185,6 +219,22 @@ function decodePayload(hex) {
       if (ts === null || mask === null) continue;
       const rec = { timestamp: new Date(ts * 1000), type: "20DD" };
       let offset = i + 8;
+      if (mask > 7) {
+        // pous de 3 sondes: bit 0..8 = (P,T,C) de les sondes 1, 2 i 3
+        const hp = [{}, {}, {}];
+        for (let b = 0; b < 16; b++) {
+          if (!(mask & (1 << b))) continue;
+          if (bytes[offset] === 0x25) {
+            const v = readFloat32LE(offset + 1);
+            if (v !== null && b < 9) hp[Math.floor(b / 3)][["pressureBar", "tempC", "condMScm"][b % 3]] = v;
+          }
+          offset += 5;
+        }
+        if (hp[0].pressureBar !== undefined) rec.pressureBar = hp[0].pressureBar;
+        if (hp[0].tempC !== undefined) rec.tempC = hp[0].tempC;
+        if (hp[0].condMScm !== undefined) rec.condMScm = hp[0].condMScm;
+        rec.conds = hp.map((q) => q.condMScm);
+      } else {
       if (mask & 1) {
         if (bytes[offset] === 0x25) {
           const v = readFloat32LE(offset + 1);
@@ -206,11 +256,22 @@ function decodePayload(hex) {
         }
         offset += 5;
       }
+      }
       out.historical.push(rec);
     }
   }
 
+  if (out.pressureBar !== undefined || out.tempC !== undefined || out.condMScm !== undefined) {
+    out.probes[0] = { pressureBar: out.pressureBar, tempC: out.tempC, condMScm: out.condMScm };
+  }
+  // conductivitats [dolça, interfase, salada] si hi ha alguna sonda extra amb dades
+  out.conds = null;
+  if (out.probes[1] || out.probes[2]) {
+    out.conds = [0, 1, 2].map((k) => (out.probes[k] ? out.probes[k].condMScm : undefined));
+  }
+  const hasExtra = !!out.conds && out.conds.some((v) => v !== undefined);
   const hasAnything =
+    hasExtra ||
     out.pressureBar !== undefined ||
     out.tempC !== undefined ||
     out.condMScm !== undefined ||
@@ -460,6 +521,7 @@ async function parseLastReadingByEui(file) {
       (decoded.pressureBar !== undefined ||
         decoded.tempC !== undefined ||
         decoded.condMScm !== undefined ||
+        (decoded.conds && decoded.conds.some((v) => v !== undefined)) ||
         (decoded.historical && decoded.historical.some((h) => h.pressureBar !== undefined || h.tempC !== undefined || h.condMScm !== undefined)));
     const hasErr = !!decoded && decoded.errors && decoded.errors.length > 0;
     let status = "sense_dades";
@@ -475,6 +537,7 @@ async function parseLastReadingByEui(file) {
       pressureBar: decoded ? decoded.pressureBar : undefined,
       tempC: decoded ? decoded.tempC : undefined,
       condMScm: decoded ? decoded.condMScm : undefined,
+      conds: decoded ? decoded.conds : null,
     });
     if (decoded && decoded.historical) {
       for (const h of decoded.historical) {
@@ -486,6 +549,7 @@ async function parseLastReadingByEui(file) {
           pressureBar: h.pressureBar,
           tempC: h.tempC,
           condMScm: h.condMScm,
+          conds: h.conds || null,
         });
       }
     }
@@ -499,6 +563,9 @@ async function parseLastReadingByEui(file) {
           const hIso = h.timestamp.toISOString();
           if (hIso > entry.lastReal) entry.lastReal = hIso;
         }
+      }
+      if (decoded.conds && decoded.conds.some((v) => v !== undefined) && ts >= (entry.lastConds ? entry.lastConds.ts : "")) {
+        entry.lastConds = { ts, conds: decoded.conds };
       }
       if (decoded.battery !== undefined) entry.battery = decoded.battery;
       decoded.errors.forEach((e) => entry.errors.add(e));
@@ -533,6 +600,11 @@ const READING_STATUS_LABELS = {
   info: "missatge sense mesura (bateria/estat/info)",
   sense_dades: "sense dades reconegudes",
 };
+
+function formatProfile(lc) {
+  if (!lc || !lc.conds) return "—";
+  return lc.conds.map((v) => (v === undefined ? "—" : fmt(v, 3))).join(" / ");
+}
 
 function excelSerialToDate(serial) {
   const base = Date.UTC(1899, 11, 30);
@@ -625,12 +697,13 @@ function MuntatgesView() {
     gpio: true,
     deviceInfo: true,
     historial: true,
+    perfil: true,
   });
   const toggleCol = (key) => setVisibleCols((c) => ({ ...c, [key]: !c[key] }));
   // una columna es visible si l'usuari no l'ha amagat manualment
   const colOn = (key) => {
     if (!visibleCols[key]) return false;
-    if ((key === "lastReading" || key === "battery" || key === "errors" || key === "gpio" || key === "deviceInfo" || key === "historial") && !lastByEui)
+    if ((key === "lastReading" || key === "battery" || key === "errors" || key === "gpio" || key === "deviceInfo" || key === "historial" || key === "perfil") && !lastByEui)
       return false;
     return true;
   };
@@ -860,6 +933,7 @@ function MuntatgesView() {
       { key: "battery", label: "Bateria (%)" },
       { key: "errors", label: "Errors Modbus" },
       { key: "gpio", label: "GPIO 1/2" },
+      { key: "perfil", label: "Conductivitat dolça / interfase / salada (mS/cm)" },
       { key: "deviceInfo", label: "Info dispositiu" },
     ].filter((c) => c.always || colOn(c.key));
 
@@ -885,6 +959,7 @@ function MuntatgesView() {
         battery: activity && activity.battery !== null && activity.battery !== undefined ? activity.battery : "—",
         errors: activity && activity.errors && activity.errors.length ? activity.errors.join(", ") : "—",
         gpio: activity && (activity.gpio1 !== undefined || activity.gpio2 !== undefined) ? `${activity.gpio1 ?? "—"} / ${activity.gpio2 ?? "—"}` : "—",
+        perfil: formatProfile(activity && activity.lastConds),
         deviceInfo: (activity && activity.deviceInfo) || "—",
       };
       return columns.map((c) => values[c.key]);
@@ -1048,6 +1123,7 @@ function MuntatgesView() {
                     ["battery", "Bateria"],
                     ["errors", "Errors Modbus"],
                     ["gpio", "GPIO"],
+                    ["perfil", "Perfil conductivitat"],
                     ["deviceInfo", "Info dispositiu"],
                     ["historial", "Historial"],
                   ]
@@ -1175,6 +1251,7 @@ function MuntatgesView() {
                     {colOn("battery") && <th style={styles.th}>Bateria (%)</th>}
                     {colOn("errors") && <th style={styles.th}>Errors Modbus</th>}
                     {colOn("gpio") && <th style={styles.th}>GPIO 1/2</th>}
+                    {colOn("perfil") && <th style={styles.th}>Cond. dolça / interfase / salada (mS/cm)</th>}
                     {colOn("deviceInfo") && <th style={styles.th}>Info dispositiu</th>}
                     {colOn("historial") && <th style={styles.th}>Historial</th>}
                   </tr>
@@ -1249,6 +1326,7 @@ function MuntatgesView() {
                                 : "—"}
                             </td>
                           )}
+                          {colOn("perfil") && <td style={styles.td}>{formatProfile(activity && activity.lastConds)}</td>}
                           {colOn("deviceInfo") && <td style={styles.td}>{(activity && activity.deviceInfo) || "—"}</td>}
                           {colOn("historial") && (
                             <td style={styles.td}>
@@ -1430,12 +1508,13 @@ function NivellApp() {
         if (!groups.has(info.pozo)) groups.set(info.pozo, new Map());
         const byDate = groups.get(info.pozo);
         if (!byDate.has(date)) {
-          byDate.set(date, { pressures: [], temps: [], conds: [], nivels: [], cota: info.cota, cable: info.cable });
+          byDate.set(date, { pressures: [], temps: [], conds: [], condsP: [[], [], []], nivels: [], cota: info.cota, cable: info.cable });
         }
         const bucket = byDate.get(date);
         bucket.pressures.push(decoded.pressureBar);
         if (decoded.tempC !== undefined) bucket.temps.push(decoded.tempC);
         if (decoded.condMScm !== undefined) bucket.conds.push(decoded.condMScm);
+        if (decoded.conds) decoded.conds.forEach((v, k) => { if (v !== undefined) bucket.condsP[k].push(v); });
         bucket.nivels.push(nivel);
       }
 
@@ -1459,12 +1538,14 @@ function NivellApp() {
               pressureMH2O: avg(b.pressures) * BAR_TO_MH2O,
               tempC: avg(b.temps),
               condMScm: avg(b.conds),
+              condsP: b.condsP.map(avg),
               nivel: avg(b.nivels),
               cota: b.cota,
               cable: b.cable,
             }))
             .sort((a, b) => (a.date < b.date ? 1 : -1));
-          return { pozo, dates };
+          const multiProbe = dates.some((d) => d.condsP.some((v) => v !== null));
+          return { pozo, dates, multiProbe };
         })
         .sort((a, b) => a.pozo.localeCompare(b.pozo));
 
@@ -1510,6 +1591,9 @@ function NivellApp() {
           "Presión media (mH2O)": d.pressureMH2O !== null ? +d.pressureMH2O.toFixed(4) : "",
           "Temperatura media (°C)": d.tempC !== null ? +d.tempC.toFixed(2) : "",
           "Conductividad media (mS/cm)": d.condMScm !== null ? +d.condMScm.toFixed(3) : "",
+          "Cond. dulce (mS/cm)": g.multiProbe && d.condsP[0] !== null ? +d.condsP[0].toFixed(3) : "",
+          "Cond. interfase (mS/cm)": g.multiProbe && d.condsP[1] !== null ? +d.condsP[1].toFixed(3) : "",
+          "Cond. salada (mS/cm)": g.multiProbe && d.condsP[2] !== null ? +d.condsP[2].toFixed(3) : "",
           "Cota (m)": d.cota,
           "Cable fins cota (m)": d.cable,
           "Nivel freático (m)": d.nivel !== null ? +d.nivel.toFixed(3) : "",
@@ -1712,6 +1796,13 @@ function NivellApp() {
                             <th style={styles.th}>Pressió (mH2O)</th>
                             <th style={styles.th}>Temp. (°C)</th>
                             <th style={styles.th}>Conductivitat (mS/cm)</th>
+                            {g.multiProbe && (
+                              <>
+                                <th style={styles.th}>Cond. dolça</th>
+                                <th style={styles.th}>Cond. interfase</th>
+                                <th style={styles.th}>Cond. salada</th>
+                              </>
+                            )}
                             <th style={{ ...styles.th, color: "#2a6f68" }}>Nivell freàtic (m)</th>
                           </tr>
                         </thead>
@@ -1724,6 +1815,10 @@ function NivellApp() {
                               <td style={styles.td}>{fmt(d.pressureMH2O, 3)}</td>
                               <td style={styles.td}>{fmt(d.tempC, 2)}</td>
                               <td style={styles.td}>{d.condMScm !== null ? fmt(d.condMScm, 3) : "—"}</td>
+                              {g.multiProbe &&
+                                d.condsP.map((v, k) => (
+                                  <td key={k} style={styles.td}>{v !== null ? fmt(v, 3) : "—"}</td>
+                                ))}
                               <td style={{ ...styles.td, fontWeight: 600, color: "#1f4b46" }}>{fmt(d.nivel, 3)}</td>
                             </tr>
                           ))}
@@ -1932,6 +2027,70 @@ function PousMap({ rows, coordsByPozo, lastByEui, query }) {
   );
 }
 
+function CondProfileChart({ history }) {
+  const byDate = new Map();
+  history.forEach((h) => {
+    if (!h.conds) return;
+    const date = h.ts.slice(0, 10);
+    if (!byDate.has(date)) byDate.set(date, [[], [], []]);
+    h.conds.forEach((v, k) => {
+      if (v !== undefined) byDate.get(date)[k].push(v);
+    });
+  });
+  const days = Array.from(byDate.entries())
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([date, arr]) => ({ date, vals: arr.map((a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null)) }));
+  if (!days.length) return null;
+
+  const W = 720, H = 180, padL = 52, padR = 16, padT = 14, padB = 28;
+  const all = days.flatMap((d) => d.vals).filter((v) => v !== null);
+  let min = Math.min(...all), max = Math.max(...all);
+  if (min === max) { min -= 0.5; max += 0.5; }
+  const pad = (max - min) * 0.08;
+  min -= pad; max += pad;
+  const n = days.length;
+  const x = (i) => (n === 1 ? (padL + W - padR) / 2 : padL + (i / (n - 1)) * (W - padL - padR));
+  const y = (v) => padT + (1 - (v - min) / (max - min)) * (H - padT - padB);
+  const yTicks = Array.from({ length: 5 }, (_, i) => min + ((max - min) * i) / 4);
+  const every = Math.max(1, Math.ceil(n / 6));
+
+  return (
+    <div style={{ padding: "14px 18px 4px", background: "#fff", marginBottom: 6 }}>
+      <div style={{ display: "flex", gap: 14, fontSize: 12, marginBottom: 4, flexWrap: "wrap" }}>
+        {PROBE_CHANNELS.map((pc, k) => (
+          <span key={k} style={{ color: PROBE_COLORS[k] }}>● Sonda {k + 1} · {pc.name}</span>
+        ))}
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }}>
+        {yTicks.map((v, i) => (
+          <g key={i}>
+            <line x1={padL} x2={W - padR} y1={y(v)} y2={y(v)} stroke="#eef4f3" strokeWidth="1" />
+            <text x={padL - 8} y={y(v) + 4} textAnchor="end" fontSize="10" fill="#7c9490">{v.toFixed(2)}</text>
+          </g>
+        ))}
+        {days.map((d, i) => i % every === 0 && (
+          <text key={i} x={x(i)} y={H - 8} textAnchor="middle" fontSize="9.5" fill="#7c9490">{d.date.slice(5)}</text>
+        ))}
+        {[0, 1, 2].map((k) => {
+          const pts = days.map((d, i) => (d.vals[k] === null ? null : [x(i), y(d.vals[k]), d])).filter(Boolean);
+          if (!pts.length) return null;
+          return (
+            <g key={k}>
+              <path d={pts.map((q, j) => `${j === 0 ? "M" : "L"}${q[0].toFixed(1)},${q[1].toFixed(1)}`).join(" ")} fill="none" stroke={PROBE_COLORS[k]} strokeWidth="2" />
+              {pts.map((q, j) => (
+                <circle key={j} cx={q[0]} cy={q[1]} r="3" fill={PROBE_COLORS[k]}>
+                  <title>{q[2].date} · {PROBE_CHANNELS[k].name}: {q[2].vals[k].toFixed(3)} mS/cm</title>
+                </circle>
+              ))}
+            </g>
+          );
+        })}
+      </svg>
+      <div style={{ fontSize: 11, color: "#9fb3ae", marginBottom: 4 }}>Conductivitat (mS/cm) per dia i sonda</div>
+    </div>
+  );
+}
+
 function ReadingHistorySummary({ history, cable }) {
   const counts = { ok: 0, parcial: 0, error: 0, info: 0, sense_dades: 0 };
   history.forEach((h) => counts[h.status]++);
@@ -1979,6 +2138,7 @@ function ReadingHistorySummary({ history, cable }) {
           </span>
         )}
       </div>
+      <CondProfileChart history={history} />
       <NivellChart
         dates={chartDates}
         label={hasCable ? "Nivell freàtic (m) per dia" : "Pressió (bar) per dia — sense cable fins cota per calcular el nivell"}
