@@ -85,6 +85,8 @@ const PROBE_CHANNELS = [
   { name: "interfase", p: 10, t: 11, c: 12 },
   { name: "salada", p: 13, t: 14, c: 15 },
 ];
+// Verificat amb una lectura real d'un pou de 3 sondes: canals 7-9, 10-12 i 13-15.
+// Pous normals (1 sonda): només canals 7, 8 i 9. Els de 3 sondes es detecten pels canals 10-15.
 const PROBE_COLORS = ["#2a8f6c", "#c98a2d", "#b03a3a"];
 
 function decodePayload(hex) {
@@ -137,41 +139,48 @@ function decodePayload(hex) {
   }
 
   // --- Errors RS485/Modbus i lectures en viu (FF0E = dada, FF15 = error) ---
+  const chVals = {};
+  const chErrs = new Set();
   for (let i = 0; i + 3 <= len; i++) {
     if (bytes[i] === 0xff && (bytes[i + 1] === 0x0e || bytes[i + 1] === 0x15)) {
       const channel = bytes[i + 2];
       if (bytes[i + 1] === 0x15) {
-        if (channel === 7) out.errors.push("presió");
-        else if (channel === 8) out.errors.push("temperatura");
-        else if (channel === 9) out.errors.push("conductivitat");
-        else {
-          PROBE_CHANNELS.forEach((pc, k) => {
-            if (k === 0) return;
-            if (channel === pc.p) out.errors.push(`presió sonda ${pc.name}`);
-            else if (channel === pc.t) out.errors.push(`temperatura sonda ${pc.name}`);
-            else if (channel === pc.c) out.errors.push(`conductivitat sonda ${pc.name}`);
-          });
-        }
+        chErrs.add(channel);
         i += 2;
         continue;
       }
       if (bytes[i + 3] === 0x25) {
         const val = readFloat32LE(i + 4);
-        if (val !== null) {
-          if (channel === 7) out.pressureBar = val;
-          else if (channel === 8) out.tempC = val;
-          else if (channel === 9) out.condMScm = val;
-          PROBE_CHANNELS.forEach((pc, k) => {
-            if (k === 0) return;
-            const slot = out.probes[k] || (out.probes[k] = {});
-            if (channel === pc.p) slot.pressureBar = val;
-            else if (channel === pc.t) slot.tempC = val;
-            else if (channel === pc.c) slot.condMScm = val;
-          });
-        }
+        if (val !== null) chVals[channel] = val;
         i += 7;
       }
     }
+  }
+  const isMulti = [...Object.keys(chVals).map(Number), ...chErrs].some((c) => c >= 10 && c <= 15);
+  if (isMulti) {
+    PROBE_CHANNELS.forEach((pc, k) => {
+      const slot = {};
+      if (chVals[pc.p] !== undefined) slot.pressureBar = chVals[pc.p];
+      if (chVals[pc.t] !== undefined) slot.tempC = chVals[pc.t];
+      if (chVals[pc.c] !== undefined) slot.condMScm = chVals[pc.c];
+      if (Object.keys(slot).length) out.probes[k] = slot;
+      if (chErrs.has(pc.p)) out.errors.push(`presió sonda ${pc.name}`);
+      if (chErrs.has(pc.t)) out.errors.push(`temperatura sonda ${pc.name}`);
+      if (chErrs.has(pc.c)) out.errors.push(`conductivitat sonda ${pc.name}`);
+    });
+    // el nivell i la resta de columnes usen la sonda 1 (dolça)
+    if (out.probes[0]) {
+      out.pressureBar = out.probes[0].pressureBar;
+      out.tempC = out.probes[0].tempC;
+      out.condMScm = out.probes[0].condMScm;
+    }
+  } else {
+    if (chVals[7] !== undefined) out.pressureBar = chVals[7];
+    if (chVals[8] !== undefined) out.tempC = chVals[8];
+    if (chVals[9] !== undefined) out.condMScm = chVals[9];
+    if (chErrs.has(7)) out.errors.push("presió");
+    if (chErrs.has(8)) out.errors.push("temperatura");
+    if (chErrs.has(9)) out.errors.push("conductivitat");
   }
 
   // --- Informació del dispositiu ---
@@ -210,6 +219,22 @@ function decodePayload(hex) {
       if (ts === null || mask === null) continue;
       const rec = { timestamp: new Date(ts * 1000), type: "20DD" };
       let offset = i + 8;
+      if (mask > 7) {
+        // pous de 3 sondes: bit 0..8 = (P,T,C) de les sondes 1, 2 i 3
+        const hp = [{}, {}, {}];
+        for (let b = 0; b < 16; b++) {
+          if (!(mask & (1 << b))) continue;
+          if (bytes[offset] === 0x25) {
+            const v = readFloat32LE(offset + 1);
+            if (v !== null && b < 9) hp[Math.floor(b / 3)][["pressureBar", "tempC", "condMScm"][b % 3]] = v;
+          }
+          offset += 5;
+        }
+        if (hp[0].pressureBar !== undefined) rec.pressureBar = hp[0].pressureBar;
+        if (hp[0].tempC !== undefined) rec.tempC = hp[0].tempC;
+        if (hp[0].condMScm !== undefined) rec.condMScm = hp[0].condMScm;
+        rec.conds = hp.map((q) => q.condMScm);
+      } else {
       if (mask & 1) {
         if (bytes[offset] === 0x25) {
           const v = readFloat32LE(offset + 1);
@@ -230,6 +255,7 @@ function decodePayload(hex) {
           if (v !== null) rec.condMScm = v;
         }
         offset += 5;
+      }
       }
       out.historical.push(rec);
     }
@@ -523,6 +549,7 @@ async function parseLastReadingByEui(file) {
           pressureBar: h.pressureBar,
           tempC: h.tempC,
           condMScm: h.condMScm,
+          conds: h.conds || null,
         });
       }
     }
