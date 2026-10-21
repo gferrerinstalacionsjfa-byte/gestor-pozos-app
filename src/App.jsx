@@ -1882,7 +1882,8 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
   );
 }
 
-function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m", decimals = 3 }) {
+// invert=true: el valor és profunditat de l'aigua (cable − columna d'aigua), així que el gràfic puja quan el nivell puja.
+function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m", decimals = 3, invert = false }) {
   const points = [...dates].filter((d) => d.nivel !== null && !Number.isNaN(d.nivel)).sort((a, b) => (a.date < b.date ? -1 : 1));
   if (points.length < 2) return null;
 
@@ -1904,7 +1905,7 @@ function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m",
   max += pad;
 
   const x = (i) => padL + (i / (points.length - 1)) * (W - padL - padR);
-  const y = (v) => padT + (1 - (v - min) / (max - min)) * (H - padT - padB);
+  const y = (v) => padT + (invert ? (v - min) / (max - min) : 1 - (v - min) / (max - min)) * (H - padT - padB);
 
   const path = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.nivel).toFixed(1)}`).join(" ");
   const ticksY = 4;
@@ -2144,6 +2145,7 @@ function ReadingHistorySummary({ history, cable }) {
         label={hasCable ? "Nivell freàtic (m) per dia" : "Pressió (bar) per dia — sense cable fins cota per calcular el nivell"}
         unit={hasCable ? "m" : "bar"}
         decimals={hasCable ? 3 : 4}
+        invert={hasCable}
       />
       <div style={{ display: "flex", flexWrap: "wrap", gap: 2, maxWidth: "100%", marginTop: 8 }}>
         {history.map((h, i) => (
