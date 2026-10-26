@@ -1882,6 +1882,22 @@ function UploadCard({ label, hint, file, onFile, inputId, extra }) {
   );
 }
 
+// Escala X per temps real (un punt per lectura). Retorna { x(i), ticks:[{x,label}] }
+function makeTimeScale(tsList, padL, W, padR) {
+  const n = tsList.length;
+  const tms = tsList.map((t) => Date.parse(t));
+  const ok = n > 1 && tms.every((t) => !Number.isNaN(t)) && tms[n - 1] > tms[0];
+  const x = (i) => (n === 1 ? (padL + W - padR) / 2 : ok ? padL + ((tms[i] - tms[0]) / (tms[n - 1] - tms[0])) * (W - padL - padR) : padL + (i / (n - 1)) * (W - padL - padR));
+  const ticks = [];
+  const nt = Math.min(6, n);
+  for (let k = 0; k < nt; k++) {
+    const frac = nt === 1 ? 0 : k / (nt - 1);
+    const i = ok ? tms.reduce((best, t, idx) => (Math.abs(t - (tms[0] + frac * (tms[n - 1] - tms[0]))) < Math.abs(tms[best] - (tms[0] + frac * (tms[n - 1] - tms[0]))) ? idx : best), 0) : Math.round(frac * (n - 1));
+    ticks.push({ x: x(i), label: tsList[i].slice(5, 10) });
+  }
+  return { x, ticks };
+}
+
 // invert=true: el valor és profunditat de l'aigua (cable − columna d'aigua), així que el gràfic puja quan el nivell puja.
 function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m", decimals = 3, invert = false }) {
   const points = [...dates].filter((d) => d.nivel !== null && !Number.isNaN(d.nivel)).sort((a, b) => (a.date < b.date ? -1 : 1));
@@ -1904,13 +1920,14 @@ function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m",
   min -= pad;
   max += pad;
 
-  const x = (i) => padL + (i / (points.length - 1)) * (W - padL - padR);
+  const ts = makeTimeScale(points.map((p) => p.date), padL, W, padR);
+  const x = ts.x;
   const y = (v) => padT + (invert ? (v - min) / (max - min) : 1 - (v - min) / (max - min)) * (H - padT - padB);
 
   const path = points.map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.nivel).toFixed(1)}`).join(" ");
   const ticksY = 4;
   const yTickVals = Array.from({ length: ticksY + 1 }, (_, i) => min + ((max - min) * i) / ticksY);
-  const xLabelEvery = Math.max(1, Math.ceil(points.length / 6));
+  const dotR = points.length > 80 ? 2 : 3;
 
   return (
     <div style={{ padding: "14px 18px 4px", background: "#fff" }}>
@@ -1923,19 +1940,16 @@ function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m",
             </text>
           </g>
         ))}
-        {points.map(
-          (p, i) =>
-            i % xLabelEvery === 0 && (
-              <text key={i} x={x(i)} y={H - 8} textAnchor="middle" fontSize="9.5" fill="#7c9490">
-                {p.date.slice(5)}
-              </text>
-            )
-        )}
-        <path d={path} fill="none" stroke="#1f5e59" strokeWidth="2" />
+        {ts.ticks.map((t, i) => (
+          <text key={i} x={t.x} y={H - 8} textAnchor="middle" fontSize="9.5" fill="#7c9490">
+            {t.label}
+          </text>
+        ))}
+        <path d={path} fill="none" stroke="#1f5e59" strokeWidth="1.5" />
         {points.map((p, i) => (
-          <circle key={i} cx={x(i)} cy={y(p.nivel)} r="3" fill="#1f5e59">
+          <circle key={i} cx={x(i)} cy={y(p.nivel)} r={dotR} fill="#1f5e59">
             <title>
-              {p.date}: {p.nivel.toFixed(decimals)} {unit}
+              {p.date.slice(0, 16).replace("T", " ")}: {p.nivel.toFixed(decimals)} {unit}
             </title>
           </circle>
         ))}
@@ -2029,18 +2043,9 @@ function PousMap({ rows, coordsByPozo, lastByEui, query }) {
 }
 
 function CondProfileChart({ history }) {
-  const byDate = new Map();
-  history.forEach((h) => {
-    if (!h.conds) return;
-    const date = h.ts.slice(0, 10);
-    if (!byDate.has(date)) byDate.set(date, [[], [], []]);
-    h.conds.forEach((v, k) => {
-      if (v !== undefined) byDate.get(date)[k].push(v);
-    });
-  });
-  const days = Array.from(byDate.entries())
-    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([date, arr]) => ({ date, vals: arr.map((a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null)) }));
+  const days = history
+    .filter((h) => h.conds && h.conds.some((v) => v !== undefined))
+    .map((h) => ({ date: h.ts, vals: h.conds.map((v) => (v === undefined ? null : v)) }));
   if (!days.length) return null;
 
   const W = 720, H = 180, padL = 52, padR = 16, padT = 14, padB = 28;
@@ -2050,10 +2055,10 @@ function CondProfileChart({ history }) {
   const pad = (max - min) * 0.08;
   min -= pad; max += pad;
   const n = days.length;
-  const x = (i) => (n === 1 ? (padL + W - padR) / 2 : padL + (i / (n - 1)) * (W - padL - padR));
+  const tsc = makeTimeScale(days.map((d) => d.date), padL, W, padR);
+  const x = tsc.x;
   const y = (v) => padT + (1 - (v - min) / (max - min)) * (H - padT - padB);
   const yTicks = Array.from({ length: 5 }, (_, i) => min + ((max - min) * i) / 4);
-  const every = Math.max(1, Math.ceil(n / 6));
 
   return (
     <div style={{ padding: "14px 18px 4px", background: "#fff", marginBottom: 6 }}>
@@ -2069,8 +2074,8 @@ function CondProfileChart({ history }) {
             <text x={padL - 8} y={y(v) + 4} textAnchor="end" fontSize="10" fill="#7c9490">{v.toFixed(2)}</text>
           </g>
         ))}
-        {days.map((d, i) => i % every === 0 && (
-          <text key={i} x={x(i)} y={H - 8} textAnchor="middle" fontSize="9.5" fill="#7c9490">{d.date.slice(5)}</text>
+        {tsc.ticks.map((t, i) => (
+          <text key={i} x={t.x} y={H - 8} textAnchor="middle" fontSize="9.5" fill="#7c9490">{t.label}</text>
         ))}
         {[0, 1, 2].map((k) => {
           const pts = days.map((d, i) => (d.vals[k] === null ? null : [x(i), y(d.vals[k]), d])).filter(Boolean);
@@ -2080,14 +2085,14 @@ function CondProfileChart({ history }) {
               <path d={pts.map((q, j) => `${j === 0 ? "M" : "L"}${q[0].toFixed(1)},${q[1].toFixed(1)}`).join(" ")} fill="none" stroke={PROBE_COLORS[k]} strokeWidth="2" />
               {pts.map((q, j) => (
                 <circle key={j} cx={q[0]} cy={q[1]} r="3" fill={PROBE_COLORS[k]}>
-                  <title>{q[2].date} · {PROBE_CHANNELS[k].name}: {q[2].vals[k].toFixed(3)} mS/cm</title>
+                  <title>{q[2].date.slice(0, 16).replace("T", " ")} · {PROBE_CHANNELS[k].name}: {q[2].vals[k].toFixed(3)} mS/cm</title>
                 </circle>
               ))}
             </g>
           );
         })}
       </svg>
-      <div style={{ fontSize: 11, color: "#9fb3ae", marginBottom: 4 }}>Conductivitat (mS/cm) per dia i sonda</div>
+      <div style={{ fontSize: 11, color: "#9fb3ae", marginBottom: 4 }}>Conductivitat (mS/cm) — un punt per lectura i sonda</div>
     </div>
   );
 }
@@ -2098,19 +2103,11 @@ function ReadingHistorySummary({ history, cable }) {
   const total = history.length;
   const pct = (n) => (total ? Math.round((n / total) * 100) : 0);
 
-  const byDate = new Map();
-  history.forEach((h) => {
-    if (h.pressureBar === undefined) return;
-    const date = h.ts.slice(0, 10);
-    if (!byDate.has(date)) byDate.set(date, []);
-    byDate.get(date).push(h.pressureBar);
-  });
   const hasCable = cable !== null && cable !== undefined && !Number.isNaN(cable);
-  const chartDates = Array.from(byDate.entries()).map(([date, pressures]) => {
-    const avgP = pressures.reduce((a, b) => a + b, 0) / pressures.length;
-    const value = hasCable ? cable - avgP * BAR_TO_MH2O : avgP;
-    return { date, nivel: value };
-  });
+  // un punt per cada lectura amb pressió vàlida (sense fer mitjanes per dia)
+  const chartDates = history
+    .filter((h) => h.pressureBar !== undefined)
+    .map((h) => ({ date: h.ts, nivel: hasCable ? cable - h.pressureBar * BAR_TO_MH2O : h.pressureBar }));
 
   return (
     <div style={{ padding: "8px 4px" }}>
@@ -2142,7 +2139,7 @@ function ReadingHistorySummary({ history, cable }) {
       <CondProfileChart history={history} />
       <NivellChart
         dates={chartDates}
-        label={hasCable ? "Nivell freàtic (m) per dia" : "Pressió (bar) per dia — sense cable fins cota per calcular el nivell"}
+        label={hasCable ? "Nivell freàtic (m) per dia" : "Pressió (bar) — un punt per lectura; sense cable fins cota per calcular el nivell"}
         unit={hasCable ? "m" : "bar"}
         decimals={hasCable ? 3 : 4}
         invert={hasCable}
