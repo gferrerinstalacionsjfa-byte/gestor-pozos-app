@@ -442,6 +442,7 @@ async function parseMuntatgesFromWorkbook(assocWb) {
   const tipusControlIdx = findCol(headers, [/tipus\s*control/i]);
   const observacionsIdx = findCol(headers, [/observacions/i]);
   const caixaIdx = findCol(headers, [/^caixa$/i]);
+  const longCableIdx = findCol(headers, [/long\.?\s*cable/i, /cable\s*total/i]);
 
   const rows = [];
   const notMounted = [];
@@ -463,14 +464,15 @@ async function parseMuntatgesFromWorkbook(assocWb) {
     const tipusControl = tipusControlIdx !== -1 ? String(row[tipusControlIdx] || "").trim() : "";
     const observacions = observacionsIdx !== -1 ? String(row[observacionsIdx] || "").trim() : "";
     const caixa = caixaIdx !== -1 ? String(row[caixaIdx] || "").trim() : "";
-    const common = { pozo: String(pozo), eui, cota, installer, vigilant, date, acabat, remesa, tipusPou, tipusControl, observacions, caixa };
+    const longCable = longCableIdx !== -1 ? parseNumberLoose(row[longCableIdx]) : null;
+    const common = { pozo: String(pozo), eui, cota, longCable, installer, vigilant, date, acabat, remesa, tipusPou, tipusControl, observacions, caixa };
     if (cable === null) {
       // sense "Cable fins cota" vàlid -> no consta com a muntat, però es conserva per poder
       // comprovar si comunica igualment quan es puja el fitxer de lectures
       notMounted.push({ ...common, cable: null, cableRaw: cableRaw ? String(cableRaw).trim() : "" });
       continue;
     }
-    rows.push({ ...common, cable });
+    rows.push({ ...common, cable, cableRaw: cableRaw ? String(cableRaw).trim() : "" });
   }
   return { rows, notMounted };
 }
@@ -1364,10 +1366,500 @@ function MuntatgesView() {
   );
 }
 
+// ───────────────────────── VISTA DE VERIFICACIÓ (?vista=verificacio) ─────────────────────────
+// Llindars de les comprovacions. Es poden canviar aquí.
+const VERIF = {
+  silentWarnH: 36, // hores sense lectura real -> avís (el registrador reporta cada 6-12 h)
+  silentCritH: 168, // hores sense lectura real -> crític (7 dies)
+  errWindow: 20, // últimes N lectures que es miren per detectar errors constants
+  errConstRatio: 0.5, // si ≥ 50 % d'aquestes lectures tenen error -> crític
+  batteryLow: 20, // % de bateria
+  cableMin: 1, // m: per sota és sospitós
+  cableMax: 100, // m: per sobre és sospitós
+  fileOldH: 48, // hores: si l'últim missatge del fitxer és més antic, s'avisa
+};
+
+const VERIF_LABELS = {
+  NO_EUI: "Muntat sense DevEUI",
+  DUP_EUI: "DevEUI repetit",
+  NO_CABLE: "Muntat sense cable vàlid",
+  CABLE_TOTAL: "Cable fins cota = cable total",
+  CABLE_RARE: "Cable fins cota estrany",
+  NEG_LEVEL: "Nivell negatiu (cable curt?)",
+  DRY: "Sonda possiblement fora de l'aigua",
+  NOT_MARKED: "Comunica però no consta com a muntat",
+  NO_COMM: "Marcat com a muntat però no comunica",
+  SILENT: "Sense lectures recents",
+  ERR_CONST: "Errors constants",
+  ERR_ANY: "Ha enviat errors",
+  BATTERY: "Bateria baixa",
+};
+
+function parseNumberLoose(raw) {
+  if (raw === null || raw === undefined) return null;
+  const m = String(raw).match(/(\d+(?:[.,]\d+)?)/);
+  return m ? parseFloat(m[1].replace(",", ".")) : null;
+}
+
+function verifyWells(allRows, lastByEui, historyByEui) {
+  const issuesByWell = new Map(); // pozo+eui -> issues[]
+  const add = (r, sev, code, msg) => {
+    const k = r.pozo + "|" + r.eui;
+    if (!issuesByWell.has(k)) issuesByWell.set(k, []);
+    issuesByWell.get(k).push({ sev, code, msg });
+  };
+
+  // data de referència = últim missatge del fitxer (si no, avui)
+  let refMs = null;
+  if (lastByEui) {
+    for (const a of lastByEui.values()) {
+      const t = Date.parse(a.lastAny);
+      if (!Number.isNaN(t) && (refMs === null || t > refMs)) refMs = t;
+    }
+  }
+  const nowMs = Date.now();
+  const hoursSince = (ts) => {
+    const t = Date.parse(ts);
+    return Number.isNaN(t) || refMs === null ? null : (refMs - t) / 36e5;
+  };
+
+  // DevEUI repetits
+  const euiCount = new Map();
+  allRows.forEach((r) => {
+    if (r.eui) euiCount.set(r.eui, [...(euiCount.get(r.eui) || []), r.pozo]);
+  });
+
+  for (const r of allRows) {
+    const noMontar = /no\s*montar/i.test(r.acabat || "");
+    const marcat = !noMontar && (!!r.date || /^s[ií]$/i.test(r.acabat || ""));
+    const act = lastByEui && r.eui ? lastByEui.get(r.eui) : null;
+    const hist = (historyByEui && r.eui && historyByEui.get(r.eui)) || [];
+    const hasReal = !!(act && act.lastReal);
+
+    // — dades al Sheet —
+    if (marcat && !r.eui) add(r, 2, "NO_EUI", "Consta com a muntat però no té DevEUI al full.");
+    if (r.eui && euiCount.get(r.eui).length > 1) {
+      const altres = euiCount.get(r.eui).filter((p) => p !== r.pozo);
+      add(r, 2, "DUP_EUI", `El mateix DevEUI també surt a: ${altres.join(", ")}.`);
+    }
+    if (marcat && r.cable === null) {
+      add(r, 2, "NO_CABLE", `Consta com a muntat però no té "Cable fins cota" vàlid${r.cableRaw ? ` (diu: "${r.cableRaw}")` : ""}.`);
+    }
+    if (r.cable !== null && r.cable !== undefined) {
+      if (r.longCable !== null && r.longCable !== undefined && r.cable >= r.longCable - 0.005) {
+        add(r, 1, "CABLE_TOTAL", `Cable fins cota (${fmt(r.cable, 2)} m) és igual o més gran que el cable total (${fmt(r.longCable, 2)} m).`);
+      }
+      const dec = String(r.cable).split(".")[1];
+      if (r.cable < VERIF.cableMin) add(r, 1, "CABLE_RARE", `Cable fins cota molt curt (${fmt(r.cable, 2)} m).`);
+      else if (r.cable > VERIF.cableMax) add(r, 1, "CABLE_RARE", `Cable fins cota molt llarg (${fmt(r.cable, 2)} m).`);
+      else if (dec && dec.length > 2) add(r, 1, "CABLE_RARE", `Cable fins cota amb massa decimals (${r.cable} m).`);
+    }
+
+    if (!lastByEui) continue; // sense fitxer de lectures, només es comproven les dades del full
+
+    // — comunicació —
+    if (hasReal && !marcat && !noMontar) add(r, 1, "NOT_MARKED", "Envia lectures reals però no té data de muntatge ni Acabat = Sí.");
+    if (marcat && r.eui && !hasReal) add(r, 2, "NO_COMM", "Consta com a muntat però no hi ha cap lectura real al fitxer.");
+    if (hasReal && marcat) {
+      const h = hoursSince(act.lastReal);
+      if (h !== null && h > VERIF.silentCritH) add(r, 2, "SILENT", `Última lectura real fa ${Math.round(h / 24)} dies (${act.lastReal.slice(0, 16).replace("T", " ")}).`);
+      else if (h !== null && h > VERIF.silentWarnH) add(r, 1, "SILENT", `Última lectura real fa ${Math.round(h)} h (${act.lastReal.slice(0, 16).replace("T", " ")}).`);
+    }
+
+    // — errors —
+    if (hist.length) {
+      const meas = hist.filter((h) => h.status === "ok" || h.status === "parcial" || h.status === "error");
+      const recent = meas.slice(-VERIF.errWindow);
+      const bad = recent.filter((h) => h.status !== "ok");
+      const allBad = meas.filter((h) => h.status !== "ok");
+      const names = act && act.errors && act.errors.length ? act.errors.join(", ") : "";
+      if (recent.length >= 3 && bad.length / recent.length >= VERIF.errConstRatio) {
+        add(r, 2, "ERR_CONST", `Errors en ${bad.length} de les últimes ${recent.length} lectures${names ? ` (${names})` : ""}.`);
+      } else if (allBad.length) {
+        const last = allBad[allBad.length - 1].ts;
+        add(r, 1, "ERR_ANY", `${allBad.length} ${allBad.length === 1 ? "lectura amb error" : "lectures amb error"}, l'última el ${last.slice(0, 16).replace("T", " ")}${names ? ` (${names})` : ""}.`);
+      }
+    }
+
+    // — nivell calculat amb el cable (comprova que el cable sigui coherent) —
+    if (r.cable !== null && r.cable !== undefined && hist.length) {
+      const pr = hist.filter((h) => h.pressureBar !== undefined).slice(-VERIF.errWindow).map((h) => h.pressureBar);
+      if (pr.length >= 3) {
+        const sorted = [...pr].sort((a, b) => a - b);
+        const med = sorted[Math.floor(sorted.length / 2)];
+        const nivell = r.cable - med * BAR_TO_MH2O;
+        if (med < 0.005) add(r, 1, "DRY", "La pressió és ~0 bar: la sonda pot estar fora de l'aigua.");
+        else if (nivell < 0) add(r, 1, "NEG_LEVEL", `Amb aquest cable el nivell surt negatiu (${fmt(nivell, 2)} m): el cable fins cota potser és massa curt.`);
+      }
+    }
+
+    // — bateria —
+    if (act && act.battery !== null && act.battery !== undefined && act.battery < VERIF.batteryLow) {
+      add(r, 1, "BATTERY", `Bateria al ${act.battery} %.`);
+    }
+  }
+
+  // dispositius amb lectures que no consten al full
+  const known = new Set(allRows.map((r) => r.eui).filter(Boolean));
+  const unknown = [];
+  if (lastByEui) {
+    for (const [eui, a] of lastByEui.entries()) {
+      if (!known.has(eui) && !IGNORED_EUIS.has(eui)) unknown.push({ eui, lastAny: a.lastAny, lastReal: a.lastReal });
+    }
+  }
+  unknown.sort((a, b) => (a.lastAny < b.lastAny ? 1 : -1));
+
+  const fileOld = refMs !== null ? (nowMs - refMs) / 36e5 : null;
+  return { issuesByWell, unknown, refMs, fileAgeH: fileOld };
+}
+
+function VerificacioView() {
+  const [allRows, setAllRows] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [lastByEui, setLastByEui] = useState(null);
+  const [historyByEui, setHistoryByEui] = useState(null);
+  const [readingsFile, setReadingsFile] = useState(null);
+  const [readingsMeta, setReadingsMeta] = useState(null);
+  const [readingsError, setReadingsError] = useState(null);
+  const [readingsLoading, setReadingsLoading] = useState(false);
+  const [sevFilter, setSevFilter] = useState("tots"); // tots | critics | avisos
+  const [codeFilter, setCodeFilter] = useState(null);
+  const [showOk, setShowOk] = useState(false);
+  const [query, setQuery] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const wb = await fetchWorkbookFromUrl(ASSOC_CSV_URL);
+      const { rows, notMounted } = await parseMuntatgesFromWorkbook(wb);
+      setAllRows([...rows, ...notMounted]);
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const saved = loadReadingsFromStorage();
+    if (saved) {
+      setLastByEui(saved.lastByEui);
+      setHistoryByEui(saved.historyByEui);
+      setReadingsMeta({ fileName: saved.fileName, savedAt: saved.savedAt, persisted: true });
+    }
+  }, [load]);
+
+  const handleReadingsFile = useCallback(async (file) => {
+    setReadingsFile(file);
+    setReadingsLoading(true);
+    setReadingsError(null);
+    try {
+      const { lastByEui: lm, historyByEui: hm } = await parseLastReadingByEui(file);
+      setLastByEui(lm);
+      setHistoryByEui(hm);
+      const meta = { fileName: file.name, savedAt: new Date().toISOString() };
+      const persisted = saveReadingsToStorage({ lastByEui: lm, historyByEui: hm, ...meta });
+      setReadingsMeta({ ...meta, persisted });
+    } catch (e) {
+      setReadingsError(e.message || String(e));
+    } finally {
+      setReadingsLoading(false);
+    }
+  }, []);
+
+  const result = useMemo(() => (allRows ? verifyWells(allRows, lastByEui, historyByEui) : null), [allRows, lastByEui, historyByEui]);
+
+  const wells = useMemo(() => {
+    if (!allRows || !result) return [];
+    return allRows
+      .map((r) => {
+        const issues = (result.issuesByWell.get(r.pozo + "|" + r.eui) || []).slice().sort((a, b) => b.sev - a.sev);
+        const sev = issues.length ? issues[0].sev : 0;
+        return { r, issues, sev };
+      })
+      .sort((a, b) => b.sev - a.sev || b.issues.length - a.issues.length || a.r.pozo.localeCompare(b.r.pozo));
+  }, [allRows, result]);
+
+  const counts = useMemo(() => {
+    const c = { total: wells.length, ok: 0, avis: 0, crit: 0, byCode: {} };
+    wells.forEach((w) => {
+      if (w.sev === 2) c.crit++;
+      else if (w.sev === 1) c.avis++;
+      else c.ok++;
+      w.issues.forEach((i) => (c.byCode[i.code] = (c.byCode[i.code] || 0) + 1));
+    });
+    return c;
+  }, [wells]);
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return wells.filter((w) => {
+      if (!showOk && w.sev === 0 && !codeFilter) return false;
+      if (sevFilter === "critics" && w.sev !== 2) return false;
+      if (sevFilter === "avisos" && w.sev !== 1) return false;
+      if (codeFilter && !w.issues.some((i) => i.code === codeFilter)) return false;
+      if (q && !`${w.r.pozo} ${w.r.eui} ${w.r.installer} ${w.r.vigilant} ${getIlla(w.r.pozo)}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [wells, sevFilter, codeFilter, showOk, query]);
+
+  const exportCsv = () => {
+    const esc = (v) => {
+      const s = String(v ?? "");
+      return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const head = ["Pou", "Illa", "DevEUI", "Instal·lador", "Vigilant", "Gravetat", "Avís", "Detall"];
+    const lines = [head];
+    visible.forEach((w) => {
+      if (!w.issues.length) lines.push([w.r.pozo, getIlla(w.r.pozo), (w.r.eui || "").toUpperCase(), w.r.installer, w.r.vigilant, "OK", "", ""]);
+      w.issues.forEach((i) =>
+        lines.push([w.r.pozo, getIlla(w.r.pozo), (w.r.eui || "").toUpperCase(), w.r.installer, w.r.vigilant, i.sev === 2 ? "Crític" : "Avís", VERIF_LABELS[i.code], i.msg])
+      );
+    });
+    const csv = "﻿" + lines.map((l) => l.map(esc).join(";")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `verificacio_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const sevColor = (sev) => (sev === 2 ? "#b03a3a" : sev === 1 ? "#a86a2d" : "#2a8f6c");
+  const chip = (sev) => ({
+    display: "inline-block",
+    fontSize: 11.5,
+    fontWeight: 600,
+    padding: "2px 8px",
+    borderRadius: 10,
+    color: "#fff",
+    background: sevColor(sev),
+    marginRight: 6,
+    whiteSpace: "nowrap",
+  });
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.headerBar}>
+        <div style={styles.brand}>
+          <Waves size={22} color="#e8f3f2" />
+          <span style={styles.brandText}>Verificació</span>
+        </div>
+        <span style={styles.brandSub}>Comprova que els registradors comuniquen, estan ben registrats i el cable és coherent</span>
+      </div>
+
+      <div style={styles.containerWide}>
+        {readingsMeta && !readingsFile ? (
+          <div style={styles.assocLoadedCard}>
+            <CheckCircle2 size={20} color="#2a8f6c" />
+            <div style={{ flex: 1 }}>
+              <div style={styles.uploadLabel}>Fitxer de lectures desat</div>
+              <div style={styles.uploadHint}>
+                {readingsMeta.fileName} · desat el {new Date(readingsMeta.savedAt).toLocaleString("es-ES")}
+                {lastByEui && ` · ${lastByEui.size} DevEUI amb activitat`}
+              </div>
+            </div>
+            <label htmlFor="verif-readings-input" style={styles.smallLinkBtn}>
+              <RefreshCw size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+              Canviar
+            </label>
+            <input
+              id="verif-readings-input"
+              type="file"
+              accept=".xlsx,.xls"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleReadingsFile(f);
+              }}
+            />
+          </div>
+        ) : (
+          <UploadCard
+            label="Fitxer de lectures"
+            hint="Puja l'export de lectures per comprovar la comunicació i els errors — arrossega'l aquí o fes clic"
+            file={readingsFile}
+            onFile={handleReadingsFile}
+            inputId="verif-readings-input"
+            extra={
+              readingsError ? (
+                <span style={{ color: "#a86a2d" }}>{readingsError}</span>
+              ) : readingsLoading ? (
+                <span>Analitzant…</span>
+              ) : lastByEui ? (
+                <span style={{ color: "#2a8f6c", fontWeight: 600 }}>{lastByEui.size} DevEUI amb activitat al fitxer</span>
+              ) : null
+            }
+          />
+        )}
+
+        {error && (
+          <div style={styles.errorBox}>
+            <AlertTriangle size={16} style={{ marginRight: 8, verticalAlign: "-3px" }} />
+            {error}
+          </div>
+        )}
+        {loading && <div style={styles.emptyMsg}>Carregant el full de Google Sheets…</div>}
+
+        {result && (
+          <>
+            {!lastByEui && (
+              <div style={{ ...styles.errorBox, background: "#fdf6e9", borderColor: "#ecd9ae", color: "#8a6a2d" }}>
+                Sense fitxer de lectures només es comproven les dades del full (DevEUI, cable fins cota). Puja el fitxer per comprovar també la comunicació i els errors.
+              </div>
+            )}
+            {lastByEui && result.fileAgeH !== null && result.fileAgeH > VERIF.fileOldH && (
+              <div style={{ ...styles.errorBox, background: "#fdf6e9", borderColor: "#ecd9ae", color: "#8a6a2d" }}>
+                El fitxer de lectures és antic: l'últim missatge és del {new Date(result.refMs).toLocaleString("es-ES")} (fa {Math.round(result.fileAgeH / 24)} dies).
+                Els avisos de "sense lectures" es calculen respecte d'aquesta data. Exporta un fitxer més recent per a una verificació actual.
+              </div>
+            )}
+
+            <div style={styles.statsRow}>
+              <Stat label="Total pous" value={counts.total} />
+              <Stat label="Sense avisos" value={counts.ok} />
+              <Stat label="Amb avisos" value={counts.avis} warn onClick={() => setSevFilter(sevFilter === "avisos" ? "tots" : "avisos")} />
+              <Stat label="Crítics" value={counts.crit} warn onClick={() => setSevFilter(sevFilter === "critics" ? "tots" : "critics")} />
+              {lastByEui && <Stat label="Dispositius no registrats" value={result.unknown.length} warn />}
+            </div>
+
+            <div style={{ marginTop: 18, display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+              <span style={{ fontSize: 12.5, color: "#7c9490", marginRight: 4 }}>Tipus d'avís:</span>
+              {Object.keys(VERIF_LABELS)
+                .filter((c) => counts.byCode[c])
+                .map((c) => (
+                  <button
+                    key={c}
+                    style={{ ...styles.segmentBtn, ...(codeFilter === c ? styles.segmentBtnActive : {}) }}
+                    onClick={() => setCodeFilter(codeFilter === c ? null : c)}
+                  >
+                    {VERIF_LABELS[c]} ({counts.byCode[c]})
+                  </button>
+                ))}
+              {!Object.keys(counts.byCode).length && <span style={{ fontSize: 13, color: "#2a8f6c" }}>Cap avís: tot correcte.</span>}
+            </div>
+
+            <div style={styles.searchRow}>
+              <div style={styles.searchBar}>
+                <Search size={16} color="#7c9490" />
+                <input
+                  style={styles.searchInput}
+                  placeholder="Cercar pou, DevEUI, instal·lador, vigilant, illa…"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                />
+              </div>
+              <button style={{ ...styles.secondaryBtn, ...(showOk ? styles.segmentBtnActive : {}) }} onClick={() => setShowOk((s) => !s)}>
+                {showOk ? "Amagar pous correctes" : "Mostrar també els correctes"}
+              </button>
+              <button style={styles.secondaryBtn} onClick={exportCsv}>
+                <Download size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+                Exportar CSV
+              </button>
+              <button style={styles.secondaryBtn} onClick={load}>
+                <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+                Actualitzar full
+              </button>
+            </div>
+
+            <div style={{ ...styles.groupCard, marginTop: 14 }}>
+              <div style={styles.tableWrap}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      <th style={styles.th}>Pou</th>
+                      <th style={styles.th}>Illa</th>
+                      <th style={styles.th}>DevEUI</th>
+                      <th style={styles.th}>Instal·lador</th>
+                      <th style={styles.th}>Vigilant</th>
+                      <th style={styles.th}>Estat</th>
+                      <th style={styles.th}>Detall</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visible.length === 0 && (
+                      <tr>
+                        <td style={styles.td} colSpan={7}>
+                          {counts.avis + counts.crit === 0 ? "Cap pou amb avisos." : "Cap pou coincideix amb aquest filtre."}
+                        </td>
+                      </tr>
+                    )}
+                    {visible.map((w) => (
+                      <tr key={w.r.pozo + w.r.eui} style={{ verticalAlign: "top" }}>
+                        <td style={{ ...styles.td, fontWeight: 600 }}>{w.r.pozo}</td>
+                        <td style={styles.td}>{getIlla(w.r.pozo)}</td>
+                        <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{w.r.eui ? w.r.eui.toUpperCase() : "—"}</td>
+                        <td style={styles.td}>{w.r.installer || "—"}</td>
+                        <td style={styles.td}>{w.r.vigilant || "—"}</td>
+                        <td style={styles.td}>
+                          <span style={chip(w.sev)}>{w.sev === 2 ? "Crític" : w.sev === 1 ? "Avís" : "OK"}</span>
+                        </td>
+                        <td style={styles.td}>
+                          {w.issues.length === 0
+                            ? "—"
+                            : w.issues.map((i, k) => (
+                                <div key={k} style={{ marginBottom: 3 }}>
+                                  <span style={{ color: sevColor(i.sev), fontWeight: 600 }}>{VERIF_LABELS[i.code]}:</span> {i.msg}
+                                </div>
+                              ))}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {lastByEui && result.unknown.length > 0 && (
+              <div style={{ ...styles.groupCard, marginTop: 20 }}>
+                <div style={{ padding: "12px 16px", fontWeight: 600, color: "#a86a2d" }}>
+                  Dispositius que envien dades però no consten al full ({result.unknown.length})
+                </div>
+                <div style={styles.tableWrap}>
+                  <table style={styles.table}>
+                    <thead>
+                      <tr>
+                        <th style={styles.th}>DevEUI</th>
+                        <th style={styles.th}>Últim missatge</th>
+                        <th style={styles.th}>Última lectura real</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {result.unknown.map((u) => (
+                        <tr key={u.eui}>
+                          <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{u.eui.toUpperCase()}</td>
+                          <td style={styles.td}>{(u.lastAny || "—").slice(0, 16).replace("T", " ")}</td>
+                          <td style={styles.td}>{u.lastReal ? u.lastReal.slice(0, 16).replace("T", " ") : "sense lectures reals"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            <div style={{ fontSize: 11.5, color: "#9fb3ae", marginTop: 16, lineHeight: 1.6 }}>
+              Llindars: avís si fa més de {VERIF.silentWarnH} h sense lectura real i crític a partir de {VERIF.silentCritH / 24} dies · errors constants si ≥ {Math.round(VERIF.errConstRatio * 100)} % de les
+              últimes {VERIF.errWindow} lectures tenen error · bateria baixa per sota del {VERIF.batteryLow} % · cable fins cota estrany si és &lt; {VERIF.cableMin} m, &gt; {VERIF.cableMax} m o té més de 2 decimals.
+            </div>
+          </>
+        )}
+      </div>
+
+      <footer style={styles.footer}>© {new Date().getFullYear()} Instal·lacions JFA. Tots els drets reservats.</footer>
+    </div>
+  );
+}
+
 export default function App() {
   const params = new URLSearchParams(window.location.search);
 
   if (params.get("vista") === "muntatges") return <MuntatgesView />;
+  if (params.get("vista") === "verificacio") return <VerificacioView />;
   return <NivellApp />;
 }
 
