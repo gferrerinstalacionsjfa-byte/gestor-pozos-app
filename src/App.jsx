@@ -1597,7 +1597,8 @@ function VerificacioView() {
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return wells.filter((w) => {
-      if (!showOk && w.sev === 0 && !codeFilter) return false;
+      if (!showOk && w.sev === 0 && sevFilter !== "ok") return false;
+      if (sevFilter === "ok" && w.sev !== 0) return false;
       if (sevFilter === "critics" && w.sev !== 2) return false;
       if (sevFilter === "avisos" && w.sev !== 1) return false;
       if (codeFilter && !w.issues.some((i) => i.code === codeFilter)) return false;
@@ -1721,7 +1722,7 @@ function VerificacioView() {
 
             <div style={styles.statsRow}>
               <Stat label="Total pous" value={counts.total} />
-              <Stat label="Sense avisos" value={counts.ok} />
+              <Stat label="Sense avisos" value={counts.ok} onClick={() => { setSevFilter(sevFilter === "ok" ? "tots" : "ok"); setCodeFilter(null); }} />
               <Stat label="Amb avisos" value={counts.avis} warn onClick={() => setSevFilter(sevFilter === "avisos" ? "tots" : "avisos")} />
               <Stat label="Crítics" value={counts.crit} warn onClick={() => setSevFilter(sevFilter === "critics" ? "tots" : "critics")} />
               {lastByEui && <Stat label="Dispositius no registrats" value={result.unknown.length} warn />}
@@ -1753,9 +1754,25 @@ function VerificacioView() {
                   onChange={(e) => setQuery(e.target.value)}
                 />
               </div>
-              <button style={{ ...styles.secondaryBtn, ...(showOk ? styles.segmentBtnActive : {}) }} onClick={() => setShowOk((s) => !s)}>
+              <button
+                style={{ ...styles.secondaryBtn, ...(showOk ? styles.segmentBtnActive : {}) }}
+                onClick={() => {
+                  if (!showOk) {
+                    // en mostrar els correctes es treuen els filtres que els amagarien
+                    setSevFilter("tots");
+                    setCodeFilter(null);
+                    setQuery("");
+                  }
+                  setShowOk((v) => !v);
+                }}
+              >
                 {showOk ? "Amagar pous correctes" : "Mostrar també els correctes"}
               </button>
+              {(sevFilter !== "tots" || codeFilter || query) && (
+                <button style={styles.secondaryBtn} onClick={() => { setSevFilter("tots"); setCodeFilter(null); setQuery(""); }}>
+                  Treure filtres
+                </button>
+              )}
               <button style={styles.secondaryBtn} onClick={exportCsv}>
                 <Download size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
                 Exportar CSV
@@ -1784,7 +1801,11 @@ function VerificacioView() {
                     {visible.length === 0 && (
                       <tr>
                         <td style={styles.td} colSpan={7}>
-                          {counts.avis + counts.crit === 0 ? "Cap pou amb avisos." : "Cap pou coincideix amb aquest filtre."}
+                          {sevFilter === "ok" && counts.ok === 0
+                            ? "Cap pou està completament sense avisos."
+                            : counts.avis + counts.crit === 0
+                            ? "Cap pou amb avisos."
+                            : "Cap pou coincideix amb aquest filtre."}
                         </td>
                       </tr>
                     )}
