@@ -1563,6 +1563,97 @@ async function verifSyncRequest(cfg, marks, dirtyKeys) {
   if (!data.ok) throw new Error(data.error || "error del servidor");
   return data.marks || {};
 }
+// ── Lectures acumulades al Google Sheet ──
+const ERROR_DICT = (() => {
+  const base = ["presió", "temperatura", "conductivitat"];
+  return base.concat(PROBE_CHANNELS.flatMap((pc) => base.map((b) => `${b} sonda ${pc.name}`)));
+})();
+const STATUS_CODE = { ok: "o", parcial: "p", error: "e", info: "i", sense_dades: "s" };
+const STATUS_FROM_CODE = Object.fromEntries(Object.entries(STATUS_CODE).map(([k, v]) => [v, k]));
+const r6 = (v) => (v === undefined || v === null || Number.isNaN(v) ? null : Math.round(v * 1e6) / 1e6);
+
+// format compacte per enviar-lo al Sheet: per DevEUI { meta, hist:[[ts,estat,pressió,temp,cond,errors,conds]] }
+function packReadings(lastByEui, historyByEui) {
+  const devices = {};
+  for (const [eui, a] of lastByEui.entries()) {
+    const hist = (historyByEui.get(eui) || []).map((h) => [
+      h.ts,
+      STATUS_CODE[h.status] || "s",
+      r6(h.pressureBar),
+      r6(h.tempC),
+      r6(h.condMScm),
+      (h.errors || []).map((e) => {
+        const i = ERROR_DICT.indexOf(e);
+        return i === -1 ? e : i;
+      }),
+      h.conds ? h.conds.map(r6) : null,
+    ]);
+    devices[eui] = {
+      meta: {
+        lastAny: a.lastAny || "",
+        lastReal: a.lastReal || "",
+        battery: a.battery === undefined ? null : a.battery,
+        gpio1: a.gpio1 === undefined ? null : a.gpio1,
+        gpio2: a.gpio2 === undefined ? null : a.gpio2,
+        deviceInfo: a.deviceInfo || null,
+        errors: a.errors || [],
+        lastConds: a.lastConds ? { ts: a.lastConds.ts, conds: a.lastConds.conds.map(r6) } : null,
+      },
+      hist,
+    };
+  }
+  return devices;
+}
+function unpackReadings(devices) {
+  const lastByEui = new Map();
+  const historyByEui = new Map();
+  const und = (v) => (v === null || v === undefined ? undefined : v);
+  for (const [eui, d] of Object.entries(devices || {})) {
+    const m = d.meta || {};
+    lastByEui.set(eui, {
+      lastAny: m.lastAny || "",
+      lastReal: m.lastReal || "",
+      battery: m.battery === undefined ? null : m.battery,
+      errors: m.errors || [],
+      gpio1: und(m.gpio1),
+      gpio2: und(m.gpio2),
+      deviceInfo: m.deviceInfo || null,
+      lastConds: m.lastConds ? { ts: m.lastConds.ts, conds: m.lastConds.conds.map(und) } : undefined,
+    });
+    historyByEui.set(
+      eui,
+      (d.hist || []).map((h) => ({
+        ts: h[0],
+        status: STATUS_FROM_CODE[h[1]] || "sense_dades",
+        pressureBar: und(h[2]),
+        tempC: und(h[3]),
+        condMScm: und(h[4]),
+        errors: (h[5] || []).map((c) => (typeof c === "number" ? ERROR_DICT[c] : c)),
+        conds: h[6] ? h[6].map(und) : null,
+      }))
+    );
+  }
+  return { lastByEui, historyByEui };
+}
+async function verifPullReadings(cfg) {
+  const res = await fetch(cfg.url + (cfg.url.includes("?") ? "&" : "?") + "action=readings&token=" + encodeURIComponent(cfg.token));
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "error del servidor");
+  return data.devices || {};
+}
+async function verifPushReadings(cfg, devices) {
+  const res = await fetch(cfg.url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ token: cfg.token, action: "readings", devices }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "error del servidor");
+  return data;
+}
+
 function saveVerifStore(marks, name, dirty) {
   try {
     localStorage.setItem(VERIF_STORAGE_KEY, JSON.stringify({ version: 1, marks, name, dirty: dirty || [] }));
@@ -1635,6 +1726,53 @@ function VerificacioView() {
   marksRef.current = marks;
   dirtyRef.current = dirty;
   cfgRef.current = syncCfg;
+  const [readingsSync, setReadingsSync] = useState(null); // { state: "busy"|"ok"|"error", msg }
+  const lastRef = useRef(null);
+  const histRef = useRef(null);
+  lastRef.current = lastByEui;
+  histRef.current = historyByEui;
+
+  const applyShared = (devices, extraMsg) => {
+    const { lastByEui: lm, historyByEui: hm } = unpackReadings(devices);
+    setLastByEui(lm);
+    setHistoryByEui(hm);
+    setReadingsFile(null);
+    const meta = { fileName: "Històric acumulat (Google Sheet)", savedAt: new Date().toISOString(), shared: true };
+    const persisted = saveReadingsToStorage({ lastByEui: lm, historyByEui: hm, ...meta });
+    setReadingsMeta({ ...meta, persisted });
+    let total = 0;
+    hm.forEach((h) => (total += h.length));
+    setReadingsSync({ state: "ok", msg: `${extraMsg ? extraMsg + " · " : ""}${lm.size} dispositius · ${total} missatges guardats` });
+  };
+
+  // en connectar o en obrir la pàgina: baixa l'històric de lectures del Google Sheet
+  useEffect(() => {
+    if (!storeReady || !syncCfg) return;
+    let cancelled = false;
+    (async () => {
+      setReadingsSync({ state: "busy", msg: "Carregant les lectures guardades al Google Sheet…" });
+      try {
+        const dev = await verifPullReadings(syncCfg);
+        if (cancelled) return;
+        if (Object.keys(dev).length) {
+          applyShared(dev);
+        } else if (lastRef.current) {
+          // el Sheet encara és buit però aquest navegador té un fitxer desat: s'hi puja
+          const res = await verifPushReadings(syncCfg, packReadings(lastRef.current, histRef.current));
+          const merged = await verifPullReadings(syncCfg);
+          if (!cancelled) applyShared(merged, `Fitxer d'aquest navegador pujat (${res.afegits} missatges)`);
+        } else {
+          setReadingsSync({ state: "ok", msg: "Encara no hi ha lectures guardades: puja un export." });
+        }
+      } catch (e) {
+        if (!cancelled) setReadingsSync({ state: "error", msg: e.message || String(e) });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line
+  }, [storeReady, syncCfg]);
 
   useEffect(() => {
     const st = loadVerifStore();
@@ -1768,6 +1906,18 @@ function VerificacioView() {
       const meta = { fileName: file.name, savedAt: new Date().toISOString() };
       const persisted = saveReadingsToStorage({ lastByEui: lm, historyByEui: hm, ...meta });
       setReadingsMeta({ ...meta, persisted });
+      // si hi ha sincronització, l'export s'afegeix a l'històric del Google Sheet i es mostra el resultat acumulat
+      const cfg = cfgRef.current;
+      if (cfg) {
+        setReadingsSync({ state: "busy", msg: "Guardant l'export al Google Sheet…" });
+        try {
+          const res = await verifPushReadings(cfg, packReadings(lm, hm));
+          const merged = await verifPullReadings(cfg);
+          applyShared(merged, `Export afegit: ${res.afegits} missatges nous`);
+        } catch (e) {
+          setReadingsSync({ state: "error", msg: `No s'ha pogut guardar al Google Sheet: ${e.message || e}. Es mostra el fitxer pujat, però no queda guardat.` });
+        }
+      }
     } catch (e) {
       setReadingsError(e.message || String(e));
     } finally {
@@ -1933,7 +2083,7 @@ function VerificacioView() {
             </div>
             <label htmlFor="verif-readings-input" style={styles.smallLinkBtn}>
               <RefreshCw size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
-              Canviar
+              {readingsMeta.shared ? "Afegir export nou" : "Canviar"}
             </label>
             <input
               id="verif-readings-input"
@@ -1949,7 +2099,11 @@ function VerificacioView() {
         ) : (
           <UploadCard
             label="Fitxer de lectures"
-            hint="Puja l'export de lectures per comprovar la comunicació i els errors — arrossega'l aquí o fes clic"
+            hint={
+              syncCfg
+                ? "Puja l'export de lectures: s'afegeix a l'històric guardat al Google Sheet (no l'esborra) — arrossega'l aquí o fes clic"
+                : "Puja l'export de lectures per comprovar la comunicació i els errors — arrossega'l aquí o fes clic"
+            }
             file={readingsFile}
             onFile={handleReadingsFile}
             inputId="verif-readings-input"
@@ -1963,6 +2117,20 @@ function VerificacioView() {
               ) : null
             }
           />
+        )}
+
+        {syncCfg && readingsSync && (
+          <div
+            style={{
+              fontSize: 12.5,
+              marginTop: 8,
+              fontWeight: 600,
+              color: readingsSync.state === "error" ? "#b03a3a" : readingsSync.state === "busy" ? "#7c9490" : "#2a8f6c",
+            }}
+          >
+            {readingsSync.state === "error" ? "⚠ " : readingsSync.state === "ok" ? "✓ " : ""}
+            {readingsSync.msg}
+          </div>
         )}
 
         {error && (
