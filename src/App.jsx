@@ -679,6 +679,20 @@ function MuntatgesView() {
   const [showMap, setShowMap] = useState(false);
   const [coordsByPozo, setCoordsByPozo] = useState(null);
   const [coordsError, setCoordsError] = useState(null);
+  const [readingsSync, setReadingsSync] = useState(null);
+  const sharedCfg = useRef(loadVerifSync());
+  const applyShared = (devices, extraMsg) => {
+    const { lastByEui: lm, historyByEui: hm } = unpackReadings(devices);
+    setLastByEui(lm);
+    setHistoryByEui(hm);
+    setReadingsFile(null);
+    const meta = { fileName: "Històric acumulat (Google Sheet)", savedAt: new Date().toISOString(), shared: true };
+    const persisted = saveReadingsToStorage({ lastByEui: lm, historyByEui: hm, ...meta });
+    setReadingsMeta({ ...meta, persisted });
+    let total = 0;
+    hm.forEach((h) => (total += h.length));
+    setReadingsSync({ state: "ok", msg: `${extraMsg ? extraMsg + " · " : ""}${lm.size} dispositius · ${total} missatges guardats` });
+  };
   const [visibleCols, setVisibleCols] = useState({
     eui: true,
     illa: true,
@@ -746,6 +760,25 @@ function MuntatgesView() {
     load();
   }, [load]);
 
+  // si aquest navegador està connectat al Google Sheet, es baixen les lectures acumulades
+  useEffect(() => {
+    const cfg = sharedCfg.current;
+    if (!cfg) return;
+    let cancelled = false;
+    setReadingsSync({ state: "busy", msg: "Carregant les lectures guardades al Google Sheet…" });
+    verifPullReadings(cfg)
+      .then((dev) => {
+        if (cancelled) return;
+        if (Object.keys(dev).length) applyShared(dev);
+        else setReadingsSync({ state: "ok", msg: "Encara no hi ha lectures guardades: puja un export (o puja'l primer a la vista de verificació)." });
+      })
+      .catch((e) => !cancelled && setReadingsSync({ state: "error", msg: e.message || String(e) }));
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line
+  }, []);
+
   const handleReadingsFile = useCallback(async (file) => {
     setReadingsFile(file);
     setReadingsLoading(true);
@@ -760,6 +793,17 @@ function MuntatgesView() {
       const meta = { fileName: file.name, savedAt: new Date().toISOString() };
       const persisted = saveReadingsToStorage({ lastByEui: lm, historyByEui: hm, ...meta });
       setReadingsMeta({ ...meta, persisted });
+      const cfg = sharedCfg.current;
+      if (cfg) {
+        setReadingsSync({ state: "busy", msg: "Guardant l'export al Google Sheet…" });
+        try {
+          const res = await verifPushReadings(cfg, packReadings(lm, hm));
+          const merged = await verifPullReadings(cfg);
+          applyShared(merged, `Export afegit: ${res.afegits} missatges nous`);
+        } catch (e) {
+          setReadingsSync({ state: "error", msg: `No s'ha pogut guardar al Google Sheet: ${e.message || e}. Es mostra el fitxer pujat, però no queda guardat.` });
+        }
+      }
     } catch (e) {
       setReadingsError(e.message || String(e));
     } finally {
@@ -1022,7 +1066,7 @@ function MuntatgesView() {
             </div>
             <label htmlFor="muntatges-readings-input" style={styles.smallLinkBtn}>
               <RefreshCw size={13} style={{ marginRight: 4, verticalAlign: "-2px" }} />
-              Canviar
+              {readingsMeta.shared ? "Afegir export nou" : "Canviar"}
             </label>
             <input
               id="muntatges-readings-input"
@@ -1053,7 +1097,20 @@ function MuntatgesView() {
             }
           />
         )}
-        {readingsMeta && (
+        {sharedCfg.current && readingsSync && (
+          <div
+            style={{
+              fontSize: 12.5,
+              marginTop: 8,
+              fontWeight: 600,
+              color: readingsSync.state === "error" ? "#b03a3a" : readingsSync.state === "busy" ? "#7c9490" : "#2a8f6c",
+            }}
+          >
+            {readingsSync.state === "error" ? "⚠ " : readingsSync.state === "ok" ? "✓ " : ""}
+            {readingsSync.msg}
+          </div>
+        )}
+        {readingsMeta && !readingsMeta.shared && (
           <button style={styles.tinyClearBtn} onClick={clearReadingsFile}>
             Eliminar fitxer de lectures desat
           </button>
@@ -1534,13 +1591,19 @@ function loadVerifStore() {
   }
 }
 const VERIF_SYNC_KEY = "pozos-verificacio-sync-v1";
+// Connexió per defecte al Google Sheet: amb això, QUALSEVOL navegador que obri la web ja hi queda connectat.
+// (La clau queda dins del codi de la web, així que es pot llegir des del navegador; protegeix només contra accessos casuals.)
+const SYNC_DEFAULT = {
+  url: "https://script.google.com/macros/s/AKfycbyIDk4Y362p88fHaRgPBYCLGqsQwoCo5lOUvFBg8bkDky92HTPabqE7fMY-8tzuTAuftw/exec",
+  token: "JFA2026",
+};
+const SYNC_DEFAULT_ACTIVE = !!SYNC_DEFAULT.token && SYNC_DEFAULT.token !== "__CLAU__";
 function loadVerifSync() {
   try {
     const p = JSON.parse(localStorage.getItem(VERIF_SYNC_KEY) || "null");
-    return p && p.url && p.token ? p : null;
-  } catch (e) {
-    return null;
-  }
+    if (p && p.url && p.token) return p;
+  } catch (e) {}
+  return SYNC_DEFAULT_ACTIVE ? { url: SYNC_DEFAULT.url, token: SYNC_DEFAULT.token } : null;
 }
 // Envia (o només llegeix) el registre del Google Sheet via Apps Script. Retorna les marques del servidor.
 async function verifSyncRequest(cfg, marks, dirtyKeys) {
@@ -1654,6 +1717,23 @@ async function verifPushReadings(cfg, devices) {
   return data;
 }
 
+// Enllaç de configuració: obrint-lo en un altre navegador es connecta sol (la clau va al fragment #, que no s'envia a cap servidor)
+function buildSyncLink(cfg) {
+  const b64 = btoa(unescape(encodeURIComponent(cfg.url + "\n" + cfg.token)));
+  return `${window.location.origin}${window.location.pathname}?vista=verificacio#sync=${b64}`;
+}
+function applySyncFromHash() {
+  try {
+    const m = window.location.hash.match(/#sync=([^&]+)/);
+    if (!m) return;
+    const [url, token] = decodeURIComponent(escape(atob(m[1]))).split("\n");
+    if (/^https:\/\/script\.google\.com\//.test(url || "") && token) {
+      localStorage.setItem(VERIF_SYNC_KEY, JSON.stringify({ url, token }));
+    }
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
+  } catch (e) {}
+}
+
 function saveVerifStore(marks, name, dirty) {
   try {
     localStorage.setItem(VERIF_STORAGE_KEY, JSON.stringify({ version: 1, marks, name, dirty: dirty || [] }));
@@ -1717,6 +1797,7 @@ function VerificacioView() {
   const [showSync, setShowSync] = useState(false);
   const [syncUrlDraft, setSyncUrlDraft] = useState("");
   const [syncTokenDraft, setSyncTokenDraft] = useState("");
+  const [syncLink, setSyncLink] = useState("");
   const marksRef = useRef({});
   const dirtyRef = useRef([]);
   const cfgRef = useRef(null);
@@ -2296,6 +2377,11 @@ function VerificacioView() {
             </div>
             {showSync && (
               <div style={{ ...styles.groupCard, marginTop: 10, padding: 14, fontSize: 12.5, color: "#46635f", lineHeight: 1.6 }}>
+                {SYNC_DEFAULT_ACTIVE && (
+                  <div style={{ marginBottom: 8, color: "#2a8f6c", fontWeight: 600 }}>
+                    La connexió ve configurada per defecte a la web: qualsevol navegador que obri aquest enllaç queda connectat al mateix Google Sheet, sense fer res.
+                  </div>
+                )}
                 <div style={{ marginBottom: 8 }}>
                   Les marques es desen en un full de Google Sheets teu mitjançant un Apps Script. Passos: (1) crea un full nou, (2) Extensions → Apps Script i enganxa el codi de{" "}
                   <strong>registre-verificacio.gs</strong>, canviant la CLAU, (3) Desplega → Nou desplegament → Aplicació web, executa com a "Jo" i accés "Qualsevol persona", (4) copia l'URL acabat en <code>/exec</code> i enganxa'l aquí amb la mateixa clau.
@@ -2317,12 +2403,36 @@ function VerificacioView() {
                   <button style={styles.secondaryBtn} onClick={connectSync}>
                     Desar i connectar
                   </button>
-                  {syncCfg && (
+                  {syncCfg && !SYNC_DEFAULT_ACTIVE && (
                     <button style={styles.secondaryBtn} onClick={disconnectSync}>
                       Desconnectar
                     </button>
                   )}
                 </div>
+                {syncCfg && !SYNC_DEFAULT_ACTIVE && (
+                  <div style={{ marginTop: 10 }}>
+                    <button
+                      style={styles.secondaryBtn}
+                      onClick={() => {
+                        const link = buildSyncLink(syncCfg);
+                        setSyncLink(link);
+                        try {
+                          navigator.clipboard.writeText(link);
+                        } catch (e) {}
+                      }}
+                    >
+                      Copiar enllaç per connectar un altre navegador
+                    </button>
+                    {syncLink && (
+                      <div style={{ marginTop: 6 }}>
+                        <input readOnly value={syncLink} onFocus={(e) => e.target.select()} style={{ ...styles.verifSelect, width: "100%" }} />
+                        <div style={{ fontSize: 11.5, color: "#a86a2d", marginTop: 4 }}>
+                          Aquest enllaç porta la clau: obre'l al navegador o al mòbil que vulguis connectar (es connecta sol) i no el comparteixis amb ningú més.
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
@@ -2528,6 +2638,7 @@ function VerificacioView() {
 }
 
 export default function App() {
+  applySyncFromHash();
   const params = new URLSearchParams(window.location.search);
 
   if (params.get("vista") === "muntatges") return <MuntatgesView />;
