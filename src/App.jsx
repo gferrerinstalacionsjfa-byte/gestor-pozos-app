@@ -1513,6 +1513,89 @@ function verifyWells(allRows, lastByEui, historyByEui) {
   return { issuesByWell, unknown, refMs, fileAgeH: fileOld };
 }
 
+// ── Marques de verificació (es desen al navegador, independents del fitxer de lectures) ──
+const VERIF_STORAGE_KEY = "pozos-verificacio-v1";
+const VERIF_STATUS = {
+  verificat: { label: "Verificat", color: "#2a8f6c" },
+  arreglat: { label: "Arreglat", color: "#2d7fa8" },
+  seguiment: { label: "En seguiment", color: "#a86a2d" },
+  ignorat: { label: "Ignorat (no cal fer res)", color: "#7c9490" },
+};
+const VERIF_TREATED = ["verificat", "arreglat", "ignorat"]; // estats que "tanquen" l'avís
+
+function loadVerifStore() {
+  try {
+    const raw = localStorage.getItem(VERIF_STORAGE_KEY);
+    if (!raw) return { marks: {}, name: "", dirty: [] };
+    const p = JSON.parse(raw);
+    return { marks: p.marks || {}, name: p.name || "", dirty: p.dirty || [] };
+  } catch (e) {
+    return { marks: {}, name: "", dirty: [] };
+  }
+}
+const VERIF_SYNC_KEY = "pozos-verificacio-sync-v1";
+function loadVerifSync() {
+  try {
+    const p = JSON.parse(localStorage.getItem(VERIF_SYNC_KEY) || "null");
+    return p && p.url && p.token ? p : null;
+  } catch (e) {
+    return null;
+  }
+}
+// Envia (o només llegeix) el registre del Google Sheet via Apps Script. Retorna les marques del servidor.
+async function verifSyncRequest(cfg, marks, dirtyKeys) {
+  let res;
+  if (dirtyKeys.length) {
+    const payload = {};
+    dirtyKeys.forEach((k) => {
+      if (marks[k]) payload[k] = marks[k];
+    });
+    res = await fetch(cfg.url, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ token: cfg.token, marks: payload }),
+    });
+  } else {
+    res = await fetch(cfg.url + (cfg.url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(cfg.token));
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "error del servidor");
+  return data.marks || {};
+}
+function saveVerifStore(marks, name, dirty) {
+  try {
+    localStorage.setItem(VERIF_STORAGE_KEY, JSON.stringify({ version: 1, marks, name, dirty: dirty || [] }));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+// uneix dues còpies del registre sense perdre cap entrada
+function mergeVerifMarks(a, b) {
+  const out = { ...a };
+  for (const [k, m] of Object.entries(b || {})) {
+    const cur = out[k];
+    if (!cur) {
+      out[k] = m;
+      continue;
+    }
+    const seen = new Set();
+    const log = [...(cur.log || []), ...(m.log || [])]
+      .filter((e) => {
+        const id = `${e.ts}|${e.status}|${e.note}|${e.who}`;
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      })
+      .sort((x, y) => (x.ts < y.ts ? -1 : 1));
+    const newer = (m.updatedAt || "") > (cur.updatedAt || "") ? m : cur;
+    out[k] = { ...newer, log };
+  }
+  return out;
+}
+const fmtTs = (iso) => (iso ? new Date(iso).toLocaleString("es-ES") : "—");
+
 function VerificacioView() {
   const [allRows, setAllRows] = useState(null);
   const [error, setError] = useState(null);
@@ -1527,6 +1610,128 @@ function VerificacioView() {
   const [codeFilter, setCodeFilter] = useState(null);
   const [showOk, setShowOk] = useState(false);
   const [query, setQuery] = useState("");
+  const [marks, setMarks] = useState({});
+  const [myName, setMyName] = useState("");
+  const [storeOk, setStoreOk] = useState(true);
+  const [markFilter, setMarkFilter] = useState("tots"); // tots | pendents | sense_marca | tractats | nous | <estat>
+  const [expandedKey, setExpandedKey] = useState(null);
+  const [draftNote, setDraftNote] = useState("");
+  const [showLog, setShowLog] = useState(false);
+  const [backupMsg, setBackupMsg] = useState(null);
+  const storeLoaded = useRef(false);
+  const [storeReady, setStoreReady] = useState(false);
+  const [dirty, setDirty] = useState([]); // claus modificades que encara no s'han enviat al Google Sheet
+  const [syncCfg, setSyncCfg] = useState(null); // { url, token }
+  const [syncStatus, setSyncStatus] = useState(null); // { state: "busy"|"ok"|"error", at, msg }
+  const [showSync, setShowSync] = useState(false);
+  const [syncUrlDraft, setSyncUrlDraft] = useState("");
+  const [syncTokenDraft, setSyncTokenDraft] = useState("");
+  const marksRef = useRef({});
+  const dirtyRef = useRef([]);
+  const cfgRef = useRef(null);
+  const syncingRef = useRef(false);
+  const pendingRef = useRef(false);
+  const syncNowRef = useRef(null);
+  marksRef.current = marks;
+  dirtyRef.current = dirty;
+  cfgRef.current = syncCfg;
+
+  useEffect(() => {
+    const st = loadVerifStore();
+    setMarks(st.marks);
+    setMyName(st.name);
+    setDirty(st.dirty);
+    const cfg = loadVerifSync();
+    if (cfg) {
+      setSyncCfg(cfg);
+      setSyncUrlDraft(cfg.url);
+      setSyncTokenDraft(cfg.token);
+    }
+    storeLoaded.current = true;
+    setStoreReady(true);
+  }, []);
+  useEffect(() => {
+    if (!storeLoaded.current) return;
+    setStoreOk(saveVerifStore(marks, myName, dirty));
+  }, [marks, myName, dirty]);
+
+  const syncNow = async () => {
+    const cfg = cfgRef.current;
+    if (!cfg) return;
+    if (syncingRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+    syncingRef.current = true;
+    setSyncStatus((s0) => ({ ...(s0 || {}), state: "busy" }));
+    try {
+      const sentKeys = dirtyRef.current.slice();
+      const sentStamp = {};
+      sentKeys.forEach((k) => {
+        if (marksRef.current[k]) sentStamp[k] = marksRef.current[k].updatedAt;
+      });
+      const remote = await verifSyncRequest(cfg, marksRef.current, sentKeys);
+      setMarks((cur) => mergeVerifMarks(cur, remote));
+      // es treuen de pendents les claus enviades, tret que s'hagin tornat a modificar mentrestant
+      setDirty((d) => d.filter((k) => !sentKeys.includes(k) || (marksRef.current[k] && marksRef.current[k].updatedAt !== sentStamp[k])));
+      setSyncStatus({ state: "ok", at: new Date().toISOString() });
+    } catch (e) {
+      setSyncStatus({ state: "error", msg: e.message || String(e) });
+    } finally {
+      syncingRef.current = false;
+      if (pendingRef.current) {
+        pendingRef.current = false;
+        setTimeout(() => syncNowRef.current && syncNowRef.current(), 300);
+      }
+    }
+  };
+  syncNowRef.current = syncNow;
+
+  // en obrir la pàgina o en connectar: baixa el registre i envia el que quedi pendent
+  useEffect(() => {
+    if (storeReady && syncCfg) syncNowRef.current();
+  }, [storeReady, syncCfg]);
+  // després de cada canvi, envia al cap d'un moment
+  useEffect(() => {
+    if (!storeReady || !syncCfg || !dirty.length) return;
+    const t = setTimeout(() => syncNowRef.current(), 1500);
+    return () => clearTimeout(t);
+  }, [dirty, syncCfg, storeReady]);
+  // reintent i actualització periòdica, i en tornar a la pestanya
+  useEffect(() => {
+    if (!syncCfg) return;
+    const iv = setInterval(() => syncNowRef.current(), 180000);
+    const onVis = () => {
+      if (document.visibilityState === "visible") syncNowRef.current();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearInterval(iv);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [syncCfg]);
+
+  const connectSync = () => {
+    const url = syncUrlDraft.trim();
+    const token = syncTokenDraft.trim();
+    if (!/^https:\/\/script\.google\.com\//.test(url) || !token) {
+      setSyncStatus({ state: "error", msg: "Cal enganxar l'URL de l'aplicació web (https://script.google.com/…/exec) i la clau." });
+      return;
+    }
+    try {
+      localStorage.setItem(VERIF_SYNC_KEY, JSON.stringify({ url, token }));
+    } catch (e) {}
+    // en connectar per primera vegada, tot el que hi ha en local s'envia al Sheet
+    setDirty(Object.keys(marksRef.current));
+    setSyncCfg({ url, token });
+  };
+  const disconnectSync = () => {
+    try {
+      localStorage.removeItem(VERIF_SYNC_KEY);
+    } catch (e) {}
+    setSyncCfg(null);
+    setSyncStatus(null);
+  };
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1578,14 +1783,70 @@ function VerificacioView() {
       .map((r) => {
         const issues = (result.issuesByWell.get(r.pozo + "|" + r.eui) || []).slice().sort((a, b) => b.sev - a.sev);
         const sev = issues.length ? issues[0].sev : 0;
-        return { r, issues, sev };
+        const key = r.eui || r.pozo;
+        const mark = marks[key] || null;
+        const status = mark && mark.status ? mark.status : null;
+        const newCodes = status ? issues.map((i) => i.code).filter((c) => !(mark.issuesAtMark || []).includes(c)) : [];
+        const treated = !!status && VERIF_TREATED.includes(status) && newCodes.length === 0;
+        return { r, issues, sev, key, mark, status, newCodes, treated };
       })
       .sort((a, b) => b.sev - a.sev || b.issues.length - a.issues.length || a.r.pozo.localeCompare(b.r.pozo));
-  }, [allRows, result]);
+  }, [allRows, result, marks]);
+
+  const setMark = (w, status, note) => {
+    const now = new Date().toISOString();
+    setDirty((d) => (d.includes(w.key) ? d : [...d, w.key]));
+    const codes = w.issues.map((i) => i.code);
+    setMarks((cur) => {
+      const prev = cur[w.key] || { log: [] };
+      const entry = { ts: now, who: myName || "", status: status || "treta", note: note || "", issues: codes };
+      return {
+        ...cur,
+        [w.key]: {
+          pozo: w.r.pozo,
+          eui: w.r.eui || "",
+          status: status || null,
+          note: note || "",
+          updatedAt: now,
+          issuesAtMark: codes,
+          log: [...(prev.log || []), entry],
+        },
+      };
+    });
+  };
+
+  const exportBackup = () => {
+    const blob = new Blob([JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), name: myName, marks }, null, 1)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `verificacio_copia_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importBackup = async (file) => {
+    try {
+      const data = JSON.parse(await file.text());
+      if (!data || typeof data.marks !== "object") throw new Error("format no vàlid");
+      setMarks((cur) => mergeVerifMarks(cur, data.marks));
+      setDirty((d) => Array.from(new Set([...d, ...Object.keys(data.marks)])));
+      setBackupMsg(`Còpia importada: ${Object.keys(data.marks).length} pous.`);
+    } catch (e) {
+      setBackupMsg(`No s'ha pogut importar la còpia (${e.message || e}).`);
+    }
+  };
+
+  const globalLog = useMemo(() => {
+    const items = [];
+    Object.entries(marks).forEach(([k, m]) => (m.log || []).forEach((e) => items.push({ ...e, pozo: m.pozo || k, eui: m.eui || "" })));
+    return items.sort((a, b) => (a.ts < b.ts ? 1 : -1));
+  }, [marks]);
 
   const counts = useMemo(() => {
-    const c = { total: wells.length, ok: 0, avis: 0, crit: 0, byCode: {} };
+    const c = { total: wells.length, ok: 0, avis: 0, crit: 0, byCode: {}, pendents: 0, nous: 0 };
     wells.forEach((w) => {
+      if (w.sev > 0 && !w.treated) c.pendents++;
+      if (w.newCodes.length) c.nous++;
       if (w.sev === 2) c.crit++;
       else if (w.sev === 1) c.avis++;
       else c.ok++;
@@ -1597,27 +1858,33 @@ function VerificacioView() {
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     return wells.filter((w) => {
-      if (!showOk && w.sev === 0 && sevFilter !== "ok") return false;
+      if (!showOk && w.sev === 0 && sevFilter !== "ok" && markFilter === "tots") return false;
       if (sevFilter === "ok" && w.sev !== 0) return false;
       if (sevFilter === "critics" && w.sev !== 2) return false;
       if (sevFilter === "avisos" && w.sev !== 1) return false;
       if (codeFilter && !w.issues.some((i) => i.code === codeFilter)) return false;
+      if (markFilter === "pendents" && !(w.sev > 0 && !w.treated)) return false;
+      if (markFilter === "sense_marca" && w.status) return false;
+      if (markFilter === "tractats" && !w.treated) return false;
+      if (markFilter === "nous" && !w.newCodes.length) return false;
+      if (VERIF_STATUS[markFilter] && w.status !== markFilter) return false;
       if (q && !`${w.r.pozo} ${w.r.eui} ${w.r.installer} ${w.r.vigilant} ${getIlla(w.r.pozo)}`.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [wells, sevFilter, codeFilter, showOk, query]);
+  }, [wells, sevFilter, codeFilter, markFilter, showOk, query]);
 
   const exportCsv = () => {
     const esc = (v) => {
       const s = String(v ?? "");
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const head = ["Pou", "Illa", "DevEUI", "Instal·lador", "Vigilant", "Gravetat", "Avís", "Detall"];
+    const head = ["Pou", "Illa", "DevEUI", "Instal·lador", "Vigilant", "Gravetat", "Avís", "Detall", "Verificació", "Nota", "Data verificació"];
     const lines = [head];
     visible.forEach((w) => {
-      if (!w.issues.length) lines.push([w.r.pozo, getIlla(w.r.pozo), (w.r.eui || "").toUpperCase(), w.r.installer, w.r.vigilant, "OK", "", ""]);
+      const vx = [w.status ? VERIF_STATUS[w.status].label : "", w.mark ? w.mark.note : "", w.mark && w.status ? fmtTs(w.mark.updatedAt) : ""];
+      if (!w.issues.length) lines.push([w.r.pozo, getIlla(w.r.pozo), (w.r.eui || "").toUpperCase(), w.r.installer, w.r.vigilant, "OK", "", "", ...vx]);
       w.issues.forEach((i) =>
-        lines.push([w.r.pozo, getIlla(w.r.pozo), (w.r.eui || "").toUpperCase(), w.r.installer, w.r.vigilant, i.sev === 2 ? "Crític" : "Avís", VERIF_LABELS[i.code], i.msg])
+        lines.push([w.r.pozo, getIlla(w.r.pozo), (w.r.eui || "").toUpperCase(), w.r.installer, w.r.vigilant, i.sev === 2 ? "Crític" : "Avís", VERIF_LABELS[i.code], i.msg, ...vx])
       );
     });
     const csv = "﻿" + lines.map((l) => l.map(esc).join(";")).join("\n");
@@ -1723,6 +1990,7 @@ function VerificacioView() {
             <div style={styles.statsRow}>
               <Stat label="Total pous" value={counts.total} />
               <Stat label="Sense avisos" value={counts.ok} onClick={() => { setSevFilter(sevFilter === "ok" ? "tots" : "ok"); setCodeFilter(null); }} />
+              <Stat label="Pendents de revisar" value={counts.pendents} warn onClick={() => setMarkFilter(markFilter === "pendents" ? "tots" : "pendents")} />
               <Stat label="Amb avisos" value={counts.avis} warn onClick={() => setSevFilter(sevFilter === "avisos" ? "tots" : "avisos")} />
               <Stat label="Crítics" value={counts.crit} warn onClick={() => setSevFilter(sevFilter === "critics" ? "tots" : "critics")} />
               {lastByEui && <Stat label="Dispositius no registrats" value={result.unknown.length} warn />}
@@ -1783,6 +2051,149 @@ function VerificacioView() {
               </button>
             </div>
 
+            <div style={{ ...styles.searchRow, marginTop: 10 }}>
+              <label style={{ fontSize: 12.5, color: "#7c9490" }}>
+                Verificació:{" "}
+                <select value={markFilter} onChange={(e) => setMarkFilter(e.target.value)} style={styles.verifSelect}>
+                  <option value="tots">Tots</option>
+                  <option value="pendents">Pendents de revisar</option>
+                  <option value="nous">Amb nous avisos després de verificar ({counts.nous})</option>
+                  <option value="sense_marca">Sense cap marca</option>
+                  <option value="tractats">Tractats (verificat / arreglat / ignorat)</option>
+                  {Object.entries(VERIF_STATUS).map(([k, v]) => (
+                    <option key={k} value={k}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ fontSize: 12.5, color: "#7c9490" }}>
+                El teu nom (per al registre):{" "}
+                <input style={{ ...styles.verifSelect, width: 130 }} value={myName} onChange={(e) => setMyName(e.target.value)} placeholder="p. ex. Guillem" />
+              </label>
+              <button style={{ ...styles.secondaryBtn, ...(showLog ? styles.segmentBtnActive : {}) }} onClick={() => setShowLog((v) => !v)}>
+                Registre general ({globalLog.length})
+              </button>
+              <button style={styles.secondaryBtn} onClick={exportBackup}>
+                <Download size={14} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+                Descarregar còpia del registre
+              </button>
+              <label htmlFor="verif-backup-input" style={styles.secondaryBtn}>
+                Importar còpia
+              </label>
+              <input
+                id="verif-backup-input"
+                type="file"
+                accept=".json,application/json"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) importBackup(f);
+                  e.target.value = "";
+                }}
+              />
+            </div>
+            <div style={{ fontSize: 11.5, color: storeOk ? "#9fb3ae" : "#b03a3a", marginTop: 6 }}>
+              {storeOk
+                ? "Les marques i el registre no depenen del fitxer de lectures: pots actualitzar l'export sense perdre'ls."
+                : "Atenció: aquest navegador no permet desar les marques. Connecta la sincronització o descarrega la còpia."}
+              {backupMsg && <span style={{ marginLeft: 8, color: "#2a8f6c" }}>{backupMsg}</span>}
+            </div>
+            <div style={{ fontSize: 12.5, marginTop: 6, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+              {syncCfg ? (
+                syncStatus && syncStatus.state === "error" ? (
+                  <span style={{ color: "#b03a3a", fontWeight: 600 }}>
+                    ⚠ Sincronització amb Google Sheet fallida: {syncStatus.msg}
+                    {dirty.length ? ` (${dirty.length} pous pendents d'enviar, es desen en aquest navegador)` : ""}
+                  </span>
+                ) : syncStatus && syncStatus.state === "busy" ? (
+                  <span style={{ color: "#7c9490" }}>Sincronitzant amb Google Sheet…</span>
+                ) : (
+                  <span style={{ color: "#2a8f6c", fontWeight: 600 }}>
+                    ✓ Desat al Google Sheet{syncStatus && syncStatus.at ? ` · ${new Date(syncStatus.at).toLocaleTimeString("es-ES")}` : ""}
+                    {dirty.length ? ` · ${dirty.length} pendents` : ""}
+                  </span>
+                )
+              ) : (
+                <span style={{ color: "#a86a2d", fontWeight: 600 }}>Sincronització no configurada: les marques només es desen en aquest navegador.</span>
+              )}
+              {syncCfg && (
+                <button style={styles.smallLinkBtn} onClick={() => syncNowRef.current()}>
+                  Sincronitzar ara
+                </button>
+              )}
+              <button style={styles.smallLinkBtn} onClick={() => setShowSync((v) => !v)}>
+                {showSync ? "Tancar configuració" : "Configurar sincronització"}
+              </button>
+            </div>
+            {showSync && (
+              <div style={{ ...styles.groupCard, marginTop: 10, padding: 14, fontSize: 12.5, color: "#46635f", lineHeight: 1.6 }}>
+                <div style={{ marginBottom: 8 }}>
+                  Les marques es desen en un full de Google Sheets teu mitjançant un Apps Script. Passos: (1) crea un full nou, (2) Extensions → Apps Script i enganxa el codi de{" "}
+                  <strong>registre-verificacio.gs</strong>, canviant la CLAU, (3) Desplega → Nou desplegament → Aplicació web, executa com a "Jo" i accés "Qualsevol persona", (4) copia l'URL acabat en <code>/exec</code> i enganxa'l aquí amb la mateixa clau.
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <input
+                    style={{ ...styles.verifSelect, flex: "1 1 360px" }}
+                    placeholder="URL de l'aplicació web (https://script.google.com/macros/s/…/exec)"
+                    value={syncUrlDraft}
+                    onChange={(e) => setSyncUrlDraft(e.target.value)}
+                  />
+                  <input
+                    style={{ ...styles.verifSelect, width: 180 }}
+                    type="password"
+                    placeholder="Clau"
+                    value={syncTokenDraft}
+                    onChange={(e) => setSyncTokenDraft(e.target.value)}
+                  />
+                  <button style={styles.secondaryBtn} onClick={connectSync}>
+                    Desar i connectar
+                  </button>
+                  {syncCfg && (
+                    <button style={styles.secondaryBtn} onClick={disconnectSync}>
+                      Desconnectar
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {showLog && (
+              <div style={{ ...styles.groupCard, marginTop: 12, maxHeight: 320, overflowY: "auto" }}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      <th style={styles.th}>Data</th>
+                      <th style={styles.th}>Pou</th>
+                      <th style={styles.th}>Estat</th>
+                      <th style={styles.th}>Nota</th>
+                      <th style={styles.th}>Qui</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {globalLog.length === 0 && (
+                      <tr>
+                        <td style={styles.td} colSpan={5}>
+                          Encara no hi ha cap entrada al registre.
+                        </td>
+                      </tr>
+                    )}
+                    {globalLog.slice(0, 300).map((e, i) => (
+                      <tr key={i}>
+                        <td style={styles.td}>{fmtTs(e.ts)}</td>
+                        <td style={{ ...styles.td, fontWeight: 600 }}>{e.pozo}</td>
+                        <td style={{ ...styles.td, color: VERIF_STATUS[e.status] ? VERIF_STATUS[e.status].color : "#7c9490" }}>
+                          {VERIF_STATUS[e.status] ? VERIF_STATUS[e.status].label : e.status === "treta" ? "Marca treta" : e.status}
+                        </td>
+                        <td style={styles.td}>{e.note || "—"}</td>
+                        <td style={styles.td}>{e.who || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
             <div style={{ ...styles.groupCard, marginTop: 14 }}>
               <div style={styles.tableWrap}>
                 <table style={styles.table}>
@@ -1795,12 +2206,13 @@ function VerificacioView() {
                       <th style={styles.th}>Vigilant</th>
                       <th style={styles.th}>Estat</th>
                       <th style={styles.th}>Detall</th>
+                      <th style={styles.th}>Verificació</th>
                     </tr>
                   </thead>
                   <tbody>
                     {visible.length === 0 && (
                       <tr>
-                        <td style={styles.td} colSpan={7}>
+                        <td style={styles.td} colSpan={8}>
                           {sevFilter === "ok" && counts.ok === 0
                             ? "Cap pou està completament sense avisos."
                             : counts.avis + counts.crit === 0
@@ -1810,7 +2222,8 @@ function VerificacioView() {
                       </tr>
                     )}
                     {visible.map((w) => (
-                      <tr key={w.r.pozo + w.r.eui} style={{ verticalAlign: "top" }}>
+                      <React.Fragment key={w.r.pozo + w.r.eui}>
+                      <tr style={{ verticalAlign: "top", opacity: w.treated ? 0.6 : 1 }}>
                         <td style={{ ...styles.td, fontWeight: 600 }}>{w.r.pozo}</td>
                         <td style={styles.td}>{getIlla(w.r.pozo)}</td>
                         <td style={{ ...styles.td, fontFamily: "monospace", fontSize: 12 }}>{w.r.eui ? w.r.eui.toUpperCase() : "—"}</td>
@@ -1828,7 +2241,77 @@ function VerificacioView() {
                                 </div>
                               ))}
                         </td>
+                        <td style={styles.td}>
+                          <select
+                            value={w.status || ""}
+                            onChange={(e) => setMark(w, e.target.value || null, w.mark ? w.mark.note : "")}
+                            style={{ ...styles.verifSelect, color: w.status ? VERIF_STATUS[w.status].color : "#7c9490", fontWeight: w.status ? 600 : 400 }}
+                          >
+                            <option value="">Sense marca</option>
+                            {Object.entries(VERIF_STATUS).map(([kk, v]) => (
+                              <option key={kk} value={kk}>
+                                {v.label}
+                              </option>
+                            ))}
+                          </select>
+                          {w.newCodes.length > 0 && (
+                            <div style={{ color: "#b03a3a", fontSize: 11.5, fontWeight: 600, marginTop: 3 }}>
+                              ↻ Nous avisos: {w.newCodes.map((c) => VERIF_LABELS[c]).join(", ")}
+                            </div>
+                          )}
+                          {w.mark && w.status && (
+                            <div style={{ fontSize: 11, color: "#9fb3ae", marginTop: 3 }}>
+                              {fmtTs(w.mark.updatedAt)}
+                              {w.mark.note ? ` · ${w.mark.note.length > 40 ? w.mark.note.slice(0, 40) + "…" : w.mark.note}` : ""}
+                            </div>
+                          )}
+                          <button
+                            style={{ ...styles.smallLinkBtn, marginTop: 4 }}
+                            onClick={() => {
+                              setExpandedKey(expandedKey === w.key ? null : w.key);
+                              setDraftNote(w.mark ? w.mark.note || "" : "");
+                            }}
+                          >
+                            {expandedKey === w.key ? "Tancar" : `Nota / registre${w.mark && w.mark.log ? ` (${w.mark.log.length})` : ""}`}
+                          </button>
+                        </td>
                       </tr>
+                      {expandedKey === w.key && (
+                        <tr>
+                          <td style={{ ...styles.td, background: "#f7fbfa" }} colSpan={8}>
+                            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-start" }}>
+                              <textarea
+                                value={draftNote}
+                                onChange={(e) => setDraftNote(e.target.value)}
+                                placeholder="Nota (què s'ha comprovat o arreglat, qui ho ha fet…)"
+                                rows={3}
+                                style={{ flex: "1 1 320px", fontSize: 13, padding: 8, border: "1px solid #d8e5e3", borderRadius: 8, fontFamily: "inherit" }}
+                              />
+                              <button style={styles.secondaryBtn} onClick={() => setMark(w, w.status, draftNote)}>
+                                Desar nota al registre
+                              </button>
+                            </div>
+                            <div style={{ marginTop: 10, fontSize: 12.5 }}>
+                              {w.mark && w.mark.log && w.mark.log.length ? (
+                                [...w.mark.log].reverse().map((e, n) => (
+                                  <div key={n} style={{ marginBottom: 3 }}>
+                                    <span style={{ color: "#7c9490" }}>{fmtTs(e.ts)}</span>{" "}
+                                    <strong style={{ color: VERIF_STATUS[e.status] ? VERIF_STATUS[e.status].color : "#7c9490" }}>
+                                      {VERIF_STATUS[e.status] ? VERIF_STATUS[e.status].label : "Marca treta"}
+                                    </strong>
+                                    {e.who ? ` · ${e.who}` : ""}
+                                    {e.note ? ` — ${e.note}` : ""}
+                                    {e.issues && e.issues.length ? <span style={{ color: "#9fb3ae" }}> [avisos: {e.issues.map((c) => VERIF_LABELS[c]).join(", ")}]</span> : null}
+                                  </div>
+                                ))
+                              ) : (
+                                <span style={{ color: "#9fb3ae" }}>Encara no hi ha entrades al registre d'aquest pou.</span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </React.Fragment>
                     ))}
                   </tbody>
                 </table>
@@ -2414,7 +2897,20 @@ function makeTimeScale(tsList, padL, W, padR) {
 // invert=true: el valor és profunditat de l'aigua (cable − columna d'aigua), així que el gràfic puja quan el nivell puja.
 function NivellChart({ dates, label = "Nivell freàtic (m) per dia", unit = "m", decimals = 3, invert = false }) {
   const points = [...dates].filter((d) => d.nivel !== null && !Number.isNaN(d.nivel)).sort((a, b) => (a.date < b.date ? -1 : 1));
-  if (points.length < 2) return null;
+  if (points.length === 1) {
+    return (
+      <div style={{ padding: "10px 18px", background: "#fff", fontSize: 12.5, color: "#7c9490" }}>
+        Només hi ha 1 lectura amb pressió vàlida ({points[0].date.slice(0, 16).replace("T", " ")}: {points[0].nivel.toFixed(decimals)} {unit}); calen almenys 2 per dibuixar el gràfic.
+      </div>
+    );
+  }
+  if (points.length < 2) {
+    return (
+      <div style={{ padding: "10px 18px", background: "#fff", fontSize: 12.5, color: "#7c9490" }}>
+        Cap lectura amb pressió vàlida de la sonda de dalt: no es pot dibuixar el gràfic de nivell.
+      </div>
+    );
+  }
 
   const W = 720;
   const H = 160;
@@ -2724,6 +3220,7 @@ const styles = {
   brandText: { color: "#e8f3f2", fontSize: 20, fontWeight: 700, letterSpacing: 0.3 },
   brandSub: { color: "#9fc4c0", fontSize: 13 },
   container: { maxWidth: 1100, margin: "0 auto", padding: "24px 20px 60px" },
+  verifSelect: { fontSize: 13, padding: "5px 8px", border: "1px solid #d8e5e3", borderRadius: 7, background: "#fff", fontFamily: "inherit" },
   containerWide: { maxWidth: "100%", margin: "0 auto", padding: "24px 28px 60px" },
   uploadRow: { display: "flex", gap: 16, flexWrap: "wrap" },
   uploadCard: {
